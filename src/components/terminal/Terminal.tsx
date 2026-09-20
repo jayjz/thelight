@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useTerminal } from "@/lib/lightlight/store";
+import { useLightlightRuntimeStatus } from "@/lib/lightlight/runtime";
 import { DecisionTrace } from "./DecisionTrace";
 import { EvalStrip } from "./EvalStrip";
 import { EvidenceDrawer } from "./EvidenceDrawer";
@@ -13,6 +14,7 @@ import { TopBar } from "./TopBar";
 import { cn } from "@/lib/utils";
 
 export function Terminal() {
+  const runtime = useLightlightRuntimeStatus();
   const playing = useTerminal((s) => s.playing);
   const step = useTerminal((s) => s.step);
   const setCursor = useTerminal((s) => s.setCursor);
@@ -107,6 +109,29 @@ export function Terminal() {
   return (
     <div className="flex h-dvh min-h-0 flex-col bg-bg text-fg">
       <TopBar />
+      {runtime.mode === "ALPACA_PAPER" ? (
+        <main className="flex min-h-0 flex-1 items-center justify-center p-5">
+          <section className="w-full max-w-2xl border border-line bg-surface p-5 font-mono text-xs">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <h1 className="text-sm font-semibold text-fg">ALPACA PAPER</h1>
+              <span className="rounded-sm bg-elevated px-2 py-1 text-warn">{runtime.connectionState}</span>
+            </div>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-muted sm:grid-cols-3">
+              <div><dt className="text-2xs uppercase text-subtle">Symbol</dt><dd>{runtime.symbol}</dd></div>
+              <div><dt className="text-2xs uppercase text-subtle">Feed</dt><dd>{runtime.feed}</dd></div>
+              <div><dt className="text-2xs uppercase text-subtle">Closed bar</dt><dd>{runtime.latestClosedBarTimestamp ?? "—"}</dd></div>
+              <div><dt className="text-2xs uppercase text-subtle">Decision</dt><dd>{runtime.latestDecisionId ?? "—"}</dd></div>
+              <div><dt className="text-2xs uppercase text-subtle">Broker order</dt><dd>{runtime.latestBrokerOrderState ?? "—"}</dd></div>
+              <div><dt className="text-2xs uppercase text-subtle">Position</dt><dd>{runtime.currentPaperPosition ?? "—"}</dd></div>
+              <div><dt className="text-2xs uppercase text-subtle">Jev adapter</dt><dd>{runtime.jevAdapter}</dd></div>
+              <div><dt className="text-2xs uppercase text-subtle">Jev model</dt><dd>{runtime.jevModel}</dd></div>
+            </dl>
+            <p className="mt-5 border-t border-line pt-3 leading-relaxed text-warn">
+              {runtime.error ?? "Backend paper runtime is connected. Only closed bars may produce decisions; broker updates remain separate from decision evidence."}
+            </p>
+          </section>
+        </main>
+      ) : <>
       <p className="shrink-0 border-b border-line bg-surface px-3 py-1 font-mono text-2xs text-warn">
         PAPER / REPLAY ONLY · synthetic seeded series · Jev port is a mock · not a live
         model, not a broker, not a performance claim
@@ -161,6 +186,7 @@ export function Terminal() {
       <EvalStrip />
       <EvidenceDrawer />
       <KeyboardHelp />
+      </>}
     </div>
   );
 }

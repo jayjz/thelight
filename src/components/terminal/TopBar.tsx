@@ -1,6 +1,7 @@
 import { EXPERIMENT_ARMS, type ExperimentArm } from "@/lib/lightlight/types";
 import { fmtUtc } from "@/lib/lightlight/format";
 import { selectEvidence, useTerminal } from "@/lib/lightlight/store";
+import { useLightlightRuntimeStatus } from "@/lib/lightlight/runtime";
 import { cn } from "@/lib/utils";
 
 const ARMS: ExperimentArm[] = ["A", "B", "C", "D"];
@@ -10,6 +11,7 @@ export function TopBar() {
   const setArm = useTerminal((s) => s.setArm);
   const toggleHelp = useTerminal((s) => s.toggleHelp);
   const ev = useTerminal(selectEvidence);
+  const runtime = useLightlightRuntimeStatus();
   const ts = ev?.timestamp ?? 0;
 
   return (
@@ -27,10 +29,10 @@ export function TopBar() {
       <span className="hidden h-4 w-px bg-line-strong sm:block" />
 
       <div className="flex items-center gap-2 font-mono text-2xs md:text-xs">
-        <span className="text-fg">{ev?.symbol ?? "SYN.LL1"}</span>
-        <span className="text-subtle">1D</span>
+        <span className="text-fg">{runtime.symbol}</span>
+        <span className="text-subtle">{runtime.mode === "ALPACA_PAPER" ? "1Min" : "1D"}</span>
         <span className="rounded-xs bg-elevated px-1.5 py-0.5 text-warn ring-1 ring-line-strong">
-          SYNTHETIC
+          {runtime.mode === "ALPACA_PAPER" ? "ALPACA PAPER" : "SYNTHETIC"}
         </span>
         <span className="rounded-xs bg-paper/15 px-1.5 py-0.5 text-paper ring-1 ring-paper/30">
           PAPER

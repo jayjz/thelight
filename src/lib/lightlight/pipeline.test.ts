@@ -79,7 +79,9 @@ describe("pipeline", () => {
       candles: generateSyntheticCandles(3, 90),
     });
     for (const fill of session.fills) {
-      assert.equal(fill.fillBarIndex, fill.barIndex + 1);
+      const intent = session.ledger.intents.find((candidate) => candidate.intentId === fill.intentId);
+      assert.ok(intent);
+      assert.equal(fill.fillBarIndex, intent.createdAtBar + 1);
     }
   });
 

@@ -41,6 +41,7 @@ describe("Alpaca paper boundaries", () => {
     assert.equal(config.paperBaseUrl, ALPACA_PAPER_BASE_URL);
     assert.equal(config.dataBaseUrl, ALPACA_DATA_BASE_URL);
     assert.throws(() => loadAlpacaConfig({ ...env, ALPACA_PAPER_BASE_URL: "https://example.invalid" }), /fixed Alpaca paper domain/);
+    assert.throws(() => loadAlpacaConfig({ ...env, ALPACA_PAPER_BASE_URL: "https://api.alpaca.markets" }), /fixed Alpaca paper domain/);
   });
 
   it("accepts only a completed 1Min market-data bar", () => {

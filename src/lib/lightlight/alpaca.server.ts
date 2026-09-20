@@ -210,6 +210,13 @@ export type BrokerPositionSnapshot = {
   provenance: "ALPACA_RECONCILED";
 };
 
+/** PAPER account equity is the authoritative input to the worker risk gate. */
+export type BrokerAccountSnapshot = {
+  equity: number;
+  reconciledAt: string;
+  provenance: "ALPACA_PAPER_ACCOUNT";
+};
+
 /** Deliberate, auditable escape hatch for an UNKNOWN submission. */
 export type SubmissionRecovery = "AUTHORIZE_RESUBMISSION_AFTER_ABSENT_LOOKUP";
 
@@ -231,6 +238,74 @@ export interface ExecutionPort {
     recovery?: SubmissionRecovery,
   ): Promise<BrokerOrderState>;
   reconcile(intent: ExecutionIntent): Promise<BrokerOrderState>;
+}
+
+/** Broker reads used by the worker before it may dispatch an intent. */
+export type OpenBrokerOrder = {
+  clientOrderId: string;
+  brokerOrderId: string | null;
+  status: ExecutionStatus;
+};
+
+/**
+ * Fixed-domain paper broker authority. The worker deliberately uses this
+ * separate read boundary rather than interpreting a local/replay position.
+ */
+export class AlpacaPaperBroker {
+  private readonly execution: AlpacaPaperExecution;
+  private readonly config: AlpacaConfig;
+  private readonly request: typeof fetch;
+
+  constructor(
+    config: AlpacaConfig,
+    request: typeof fetch = fetch,
+  ) {
+    this.config = config;
+    this.request = request;
+    if (config.paperBaseUrl !== ALPACA_PAPER_BASE_URL) throw new Error("LIVE_TRADING_FORBIDDEN");
+    this.execution = new AlpacaPaperExecution(config, request);
+  }
+
+  async account(): Promise<BrokerAccountSnapshot> {
+    const response = await this.request(`${ALPACA_PAPER_BASE_URL}/v2/account`, { headers: alpacaHeaders(this.config) });
+    if (response.status === 401 || response.status === 403) throw new AlpacaTransportError("AUTHENTICATION_FAILURE", "Alpaca paper authentication failed.");
+    if (!response.ok) throw new AlpacaTransportError("HTTP_FAILURE", `Alpaca paper account reconciliation failed: ${response.status}.`);
+    const body = await response.json() as Record<string, unknown>;
+    const equity = Number(body.equity);
+    if (!Number.isFinite(equity) || equity <= 0) throw new AlpacaTransportError("HTTP_FAILURE", "Alpaca returned invalid paper account equity.");
+    return { equity, reconciledAt: new Date().toISOString(), provenance: "ALPACA_PAPER_ACCOUNT" };
+  }
+
+  async position(): Promise<BrokerPositionSnapshot> {
+    const response = await this.request(`${ALPACA_PAPER_BASE_URL}/v2/positions/${encodeURIComponent(this.config.symbol)}`, { headers: alpacaHeaders(this.config) });
+    if (response.status === 404) {
+      return { symbol: this.config.symbol, quantity: 0, reconciledAt: new Date().toISOString(), provenance: "ALPACA_RECONCILED" };
+    }
+    if (response.status === 401 || response.status === 403) throw new AlpacaTransportError("AUTHENTICATION_FAILURE", "Alpaca paper authentication failed.");
+    if (!response.ok) throw new AlpacaTransportError("HTTP_FAILURE", `Alpaca paper position reconciliation failed: ${response.status}.`);
+    const body = await response.json() as Record<string, unknown>;
+    const quantity = Number(body.qty);
+    if (!Number.isFinite(quantity) || String(body.symbol ?? "").toUpperCase() !== this.config.symbol) throw new AlpacaTransportError("HTTP_FAILURE", "Alpaca returned an invalid paper position.");
+    return { symbol: this.config.symbol, quantity, reconciledAt: new Date().toISOString(), provenance: "ALPACA_RECONCILED" };
+  }
+
+  async openOrders(): Promise<OpenBrokerOrder[]> {
+    const response = await this.request(`${ALPACA_PAPER_BASE_URL}/v2/orders?status=open&symbols=${encodeURIComponent(this.config.symbol)}&direction=asc`, { headers: alpacaHeaders(this.config) });
+    if (response.status === 401 || response.status === 403) throw new AlpacaTransportError("AUTHENTICATION_FAILURE", "Alpaca paper authentication failed.");
+    if (!response.ok) throw new AlpacaTransportError("HTTP_FAILURE", `Alpaca paper open-order reconciliation failed: ${response.status}.`);
+    const orders = await response.json() as Array<Record<string, unknown>>;
+    if (!Array.isArray(orders)) throw new AlpacaTransportError("HTTP_FAILURE", "Alpaca returned invalid open orders.");
+    return orders.map((order) => ({
+      clientOrderId: String(order.client_order_id ?? ""),
+      brokerOrderId: String(order.id ?? "") || null,
+      status: orderStatus(order),
+    }));
+  }
+
+  reconcile(intent: ExecutionIntent): Promise<BrokerOrderState> { return this.execution.reconcile(intent); }
+  submit(intent: ExecutionIntent, position: BrokerPositionSnapshot, recovery?: SubmissionRecovery): Promise<BrokerOrderState> {
+    return this.execution.submit(intent, position, recovery);
+  }
 }
 
 /** Maps a broker-originated trade update without changing decision evidence. */
