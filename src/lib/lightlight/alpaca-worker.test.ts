@@ -5,7 +5,7 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { BrokerAccountSnapshot, BrokerOrderState, BrokerPositionSnapshot, OpenBrokerOrder } from "./alpaca.server.ts";
 import { ALPACA_PAPER_BASE_URL, type AlpacaConfig } from "./alpaca.server.ts";
-import { AlpacaPaperWorker, MemoryAlpacaWorkerStore, deterministicClientOrderId, deterministicDecisionId, isRegularUsEquitySession } from "./alpaca-worker.server.ts";
+import { ALPACA_WORKER_ASSET, AlpacaPaperWorker, MemoryAlpacaWorkerStore, alpacaPaperWorkerKey, deterministicClientOrderId, deterministicDecisionId, isRegularUsEquitySession } from "./alpaca-worker.server.ts";
 import type { MarketSource } from "./market.ts";
 import type { ExecutionIntent } from "./types.ts";
 
@@ -20,6 +20,7 @@ class FakeBroker {
   openOrderCalls = 0;
   posts = 0;
   positionQuantity = 0;
+  positionSymbol = "SPY";
   equity = 100_000;
   throwAccount = false;
   throwPosition = false;
@@ -36,7 +37,7 @@ class FakeBroker {
   async position(): Promise<BrokerPositionSnapshot> {
     this.positionCalls += 1;
     if (this.throwPosition) throw new Error("POSITION_UNAVAILABLE");
-    return { symbol: "SPY", quantity: this.positionQuantity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_RECONCILED" };
+    return { symbol: this.positionSymbol, quantity: this.positionQuantity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_RECONCILED" };
   }
   async openOrders(): Promise<OpenBrokerOrder[]> {
     this.openOrderCalls += 1;
@@ -234,6 +235,10 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     for (const bar of rawBars()) await unavailable.processRawBar(bar);
     assert.equal(unavailable.snapshot().workerState, "HALTED"); assert.equal(unavailableBroker.posts, 0);
 
+    const wrongSymbolStore = new MemoryAlpacaWorkerStore(); const wrongSymbolBroker = new FakeBroker(); wrongSymbolBroker.positionSymbol = "QQQ";
+    const wrongSymbol = worker(wrongSymbolStore, wrongSymbolBroker); await wrongSymbol.start();
+    assert.equal(wrongSymbol.snapshot().workerState, "HALTED", "SPY worker rejects a non-SPY broker position");
+
     const conflictStore = new MemoryAlpacaWorkerStore(); const conflictBroker = new FakeBroker(); conflictBroker.openOnDispatch = true;
     const conflictWorker = worker(conflictStore, conflictBroker); await conflictWorker.start();
     for (const bar of rawBars()) await conflictWorker.processRawBar(bar);
@@ -348,6 +353,12 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     const timestamp = Date.parse("2026-09-21T13:30:00.000Z"); const id = deterministicDecisionId(timestamp);
     assert.equal(id, deterministicDecisionId(timestamp));
     assert.equal(deterministicClientOrderId(id), deterministicClientOrderId(id));
+    assert.equal(alpacaPaperWorkerKey(), "alpaca-paper:SPY:15Min:alpaca-paper-worker-v1");
+    assert.equal(alpacaPaperWorkerKey(ALPACA_WORKER_ASSET), alpacaPaperWorkerKey());
+    const target = worker(new MemoryAlpacaWorkerStore(), new FakeBroker());
+    assert.equal(target.snapshot().symbol, "SPY");
+    assert.equal(target.snapshot().feed, "iex");
+    assert.equal(target.snapshot().decisionTimeframe, "15Min");
   });
 
   it("uses the exact New York completed-bucket boundary", () => {

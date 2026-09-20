@@ -68,6 +68,20 @@ describe("Alpaca paper boundaries", () => {
     assert.throws(() => loadAlpacaConfig({ ...env, ALPACA_PAPER_BASE_URL: "https://api.alpaca.markets" }), /fixed Alpaca paper domain/);
   });
 
+  it("derives the default SPY market source as an IEX subscription", async () => {
+    const socket = new FakeWebSocket();
+    const source = new AlpacaMarketSource(loadAlpacaConfig({ ALPACA_API_KEY_ID: "key", ALPACA_API_SECRET_KEY: "secret" }), () => socket);
+    assert.equal(source.id, "alpaca:iex:SPY:1Min");
+    const iterator = source.bars()[Symbol.asyncIterator]();
+    void iterator.next();
+    await socket.message(JSON.stringify([{ T: "success", msg: "connected" }]));
+    await socket.message(JSON.stringify([{ T: "success", msg: "authenticated" }]));
+    assert.deepEqual(socket.sent.map((payload) => JSON.parse(payload)), [
+      { action: "auth", key: "key", secret: "secret" },
+      { action: "subscribe", bars: ["SPY"] },
+    ]);
+  });
+
   it("accepts only a completed 1Min market-data bar", () => {
     const message = { T: "b" as const, S: "SPY", o: 1, h: 2, l: 0.5, c: 1.5, v: 10, t: "2026-01-01T00:00:00Z" };
     assert.equal(closedBarFromAlpaca(message, Date.parse("2026-01-01T00:00:30Z")), null);

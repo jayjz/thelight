@@ -1,5 +1,6 @@
 import { AlpacaConfigurationError } from "./alpaca.server.ts";
 import { readAlpacaPaperWorkerSnapshot, type AlpacaWorkerSnapshot } from "./alpaca-worker.server.ts";
+import { SPY_SPEC, alpacaEquityFeedFor } from "./assets.ts";
 import type { TradingMode } from "./types.ts";
 
 export type LightlightRuntimeStatus = {
@@ -40,18 +41,18 @@ export async function readLightlightRuntimeStatus(): Promise<LightlightRuntimeSt
     const snapshot = await readAlpacaPaperWorkerSnapshot();
     return snapshot
       ? fromWorker(snapshot)
-      : unavailable(mode, "SPY", "iex", "DISCONNECTED_STREAM", "PAPER worker has not been explicitly started by the server operator.");
+      : unavailable(mode, SPY_SPEC.symbol, alpacaEquityFeedFor(SPY_SPEC), "DISCONNECTED_STREAM", "PAPER worker has not been explicitly started by the server operator.");
   } catch (error) {
     if (error instanceof AlpacaConfigurationError) {
       return unavailable(
         mode,
-        "SPY",
-        "iex",
+        SPY_SPEC.symbol,
+        alpacaEquityFeedFor(SPY_SPEC),
         error.kind === "INVALID_PAPER_DOMAIN" ? "ERROR" : error.kind,
         error.message,
       );
     }
-    return unavailable(mode, "SPY", "iex", "DISCONNECTED_STREAM", error instanceof Error ? error.message : "Alpaca connection failed.");
+    return unavailable(mode, SPY_SPEC.symbol, alpacaEquityFeedFor(SPY_SPEC), "DISCONNECTED_STREAM", error instanceof Error ? error.message : "Alpaca connection failed.");
   }
 }
 

@@ -16,11 +16,14 @@ import { MemoryAlpacaWorkerStore, SqlAlpacaWorkerStore, type AlpacaWorkerStore, 
 import { computeFeatures } from "./features.ts";
 import { buildJevRequest, createMockJevAdapter } from "./jev.ts";
 import type { MarketSource } from "./market.ts";
-import { classifyDeterministicRegime, evaluatePolicy, evaluateRisk, evaluateSignal } from "./policy.ts";
+import { SPY_SPEC, isMarketSessionOpen, type AssetSpec } from "./assets.ts";
+import { actionToPosition, classifyDeterministicRegime, evaluateAssetAwarePolicy, evaluateRisk, evaluateSignal } from "./policy.ts";
 import { STRATEGY_VERSION } from "./thresholds.ts";
 import type { ClosedBar, Evidence, ExecutionIntent, ExecutionStatus } from "./types.ts";
 
-export const ALPACA_WORKER_SYMBOL = "SPY";
+export const ALPACA_WORKER_ASSET = SPY_SPEC;
+/** @deprecated Use ALPACA_WORKER_ASSET.symbol for new callers. */
+export const ALPACA_WORKER_SYMBOL = ALPACA_WORKER_ASSET.symbol;
 export const ALPACA_WORKER_TIMEFRAME = "15Min";
 export const ALPACA_WORKER_CONFIG_VERSION = "alpaca-paper-worker-v1";
 const OWNERSHIP_LEASE_SECONDS = 30;
@@ -104,21 +107,17 @@ const emptyCheckpoint = (): WorkerCheckpoint => ({
   haltReason: null,
 });
 
-/** NYSE regular session, interpreted in America/New_York rather than host local time. */
+/** @deprecated Use isMarketSessionOpen(SPY_SPEC, timestamp) for new callers. */
 export function isRegularUsEquitySession(timestamp: number): boolean {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York", weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
-  }).formatToParts(new Date(timestamp));
-  const value = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
-  const weekday = value("weekday");
-  if (weekday === "Sat" || weekday === "Sun") return false;
-  const minuteOfDay = Number(value("hour")) * 60 + Number(value("minute"));
-  // A 15:45–16:00 completed bar is a regular-session decision bar.
-  return minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 16 * 60;
+  return isMarketSessionOpen(ALPACA_WORKER_ASSET, timestamp);
+}
+
+export function alpacaPaperWorkerKey(asset: AssetSpec = ALPACA_WORKER_ASSET): string {
+  return `alpaca-paper:${asset.symbol}:${ALPACA_WORKER_TIMEFRAME}:${ALPACA_WORKER_CONFIG_VERSION}`;
 }
 
 export function deterministicDecisionId(timestamp: number): string {
-  const identity = [ALPACA_WORKER_SYMBOL, ALPACA_WORKER_TIMEFRAME, timestamp, "ema_trend", "C", ALPACA_WORKER_CONFIG_VERSION].join("|");
+  const identity = [ALPACA_WORKER_ASSET.symbol, ALPACA_WORKER_TIMEFRAME, timestamp, "ema_trend", "C", ALPACA_WORKER_CONFIG_VERSION].join("|");
   return `LLP-${createHash("sha256").update(identity).digest("hex").slice(0, 32)}`;
 }
 
@@ -171,8 +170,8 @@ export class AlpacaPaperWorker {
   constructor(options: AlpacaPaperWorkerOptions) {
     this.options = options;
     if (options.config.paperBaseUrl !== "https://paper-api.alpaca.markets") throw new Error("LIVE_TRADING_FORBIDDEN");
-    if (options.config.symbol !== ALPACA_WORKER_SYMBOL) throw new Error("ALPACA_WORKER_ONLY_SUPPORTS_SPY");
-    this.key = `alpaca-paper:${options.config.symbol}:${ALPACA_WORKER_TIMEFRAME}:${ALPACA_WORKER_CONFIG_VERSION}`;
+    if (options.config.symbol !== ALPACA_WORKER_ASSET.symbol) throw new Error("ALPACA_WORKER_ONLY_SUPPORTS_SPY");
+    this.key = alpacaPaperWorkerKey(ALPACA_WORKER_ASSET);
   }
 
   snapshot(): AlpacaWorkerSnapshot {
@@ -311,7 +310,7 @@ export class AlpacaPaperWorker {
       const slots = Array.from({ length: 15 }, (_, index) => byTimestamp.get(start + index * 60_000));
       // Continuity is exchange-calendar semantics, not an injectable dispatch
       // test override. A test may veto dispatch without fabricating a gap.
-      const regular = isRegularUsEquitySession(start);
+      const regular = isMarketSessionOpen(ALPACA_WORKER_ASSET, start);
       const complete = slots.every((slot) => slot);
       if (!complete) {
         // The newest live bucket is still accumulating. Its absence of future
@@ -352,7 +351,7 @@ export class AlpacaPaperWorker {
       const decisionBar = trailingContinuous[index]!;
       const decisionId = deterministicDecisionId(decisionBar.t);
       const evidence = await this.decisionEvidence(trailingContinuous, index, decisionId);
-      const inSession = (this.options.isRegularSession ?? isRegularUsEquitySession)(decisionBar.t);
+      const inSession = (this.options.isRegularSession ?? ((timestamp) => isMarketSessionOpen(ALPACA_WORKER_ASSET, timestamp)))(decisionBar.t);
       const dispatchEligible = inSession && evidence.features.warmupComplete;
       const intent: ExecutionIntent = {
         intentId: `${decisionId}:intent`, decisionId, createdAtBar: index, createdAtTimestamp: decisionBar.t,
@@ -386,16 +385,16 @@ export class AlpacaPaperWorker {
     const deterministicRegime = classifyDeterministicRegime(feature);
     const jevRequest = buildJevRequest(feature, adapter.model);
     const jevResponse = adapter.classify(feature);
-    const policy = evaluatePolicy({ arm: "C", strategyId: "ema_trend", signal, detRegime: deterministicRegime, jev: jevResponse });
+    const policy = evaluateAssetAwarePolicy({ asset: ALPACA_WORKER_ASSET, arm: "C", strategyId: "ema_trend", signal, detRegime: deterministicRegime, jev: jevResponse });
     const equityDrawdown = this.paperEquityDrawdown();
     if (equityDrawdown === null) throw new Error("PAPER_EQUITY_UNAVAILABLE");
     const risk = evaluateRisk({ desired: policy.desired, features: feature, equityDrawdown });
     const action = risk.target;
     return {
-      id: decisionId, timestamp: feature.timestamp, barIndex: index, symbol: ALPACA_WORKER_SYMBOL, timeframe: ALPACA_WORKER_TIMEFRAME,
+      id: decisionId, timestamp: feature.timestamp, barIndex: index, symbol: ALPACA_WORKER_ASSET.symbol, timeframe: ALPACA_WORKER_TIMEFRAME,
       tradingMode: "ALPACA_PAPER", marketSnapshot: candles[index]!, features: feature, strategyId: "ema_trend", strategyVersion: STRATEGY_VERSION,
       researchRefs: ["arXiv:1308.5658", "arXiv:2602.10785"], deterministicSignal: signal, deterministicRegime,
-      jevRequest, jevResponse, policy, risk, action, targetPosition: action === "LONG" ? 1 : action === "SHORT" ? -1 : 0,
+      jevRequest, jevResponse, policy, risk, action, targetPosition: actionToPosition(action),
       abstained: policy.desired !== action || (action === "FLAT" && signal.desired !== "FLAT"),
     };
   }
@@ -403,7 +402,7 @@ export class AlpacaPaperWorker {
   private async dispatch(intent: ExecutionIntent): Promise<void> {
     // Fresh broker reads are mandatory for every target. Local/replay position is never consulted.
     const position = await this.options.broker.position();
-    if (position.symbol !== ALPACA_WORKER_SYMBOL || position.provenance !== "ALPACA_RECONCILED" || !Number.isFinite(position.quantity)) {
+    if (position.symbol !== ALPACA_WORKER_ASSET.symbol || position.provenance !== "ALPACA_RECONCILED" || !Number.isFinite(position.quantity)) {
       throw new Error("BROKER_POSITION_RECONCILIATION_REQUIRED");
     }
     this.brokerPosition = position;
@@ -448,7 +447,7 @@ export class AlpacaPaperWorker {
     this.state = "RECONCILING";
     await this.refreshPaperEquity();
     const position = await this.options.broker.position();
-    if (position.symbol !== ALPACA_WORKER_SYMBOL || position.provenance !== "ALPACA_RECONCILED" || !Number.isFinite(position.quantity)) throw new Error("BROKER_POSITION_RECONCILIATION_REQUIRED");
+    if (position.symbol !== ALPACA_WORKER_ASSET.symbol || position.provenance !== "ALPACA_RECONCILED" || !Number.isFinite(position.quantity)) throw new Error("BROKER_POSITION_RECONCILIATION_REQUIRED");
     this.brokerPosition = position;
     await this.options.store.appendBrokerPosition(position);
     this.openOrders = await this.options.broker.openOrders();
