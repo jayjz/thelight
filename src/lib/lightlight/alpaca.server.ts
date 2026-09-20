@@ -108,10 +108,18 @@ export function closedBarFromAlpaca(
 export type WebSocketLike = {
   send(payload: string): void;
   close(): void;
-  addEventListener(type: "message" | "error" | "close", listener: (event: { data?: string }) => void): void;
+  addEventListener(type: "open" | "message" | "error" | "close", listener: (event: { data?: unknown }) => void): void;
 };
 
 export type WebSocketFactory = (url: string) => WebSocketLike;
+
+/** Normalizes Node and browser WebSocket message payloads before JSON parsing. */
+export async function websocketPayloadToText(payload: unknown): Promise<string> {
+  if (typeof payload === "string") return payload;
+  if (payload instanceof Blob) return payload.text();
+  if (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload)) return new TextDecoder().decode(payload);
+  throw new TypeError("Unsupported WebSocket payload.");
+}
 
 /** Server-only, IEX-by-default real-time 1Min source. It has no synthetic fallback. */
 export class AlpacaMarketSource implements MarketSource {
@@ -138,33 +146,37 @@ export class AlpacaMarketSource implements MarketSource {
     const queue: ClosedBar[] = [];
     let failure: Error | undefined;
     let wake: (() => void) | undefined;
+    let messageQueue = Promise.resolve();
     const signal = () => {
       const resolve = wake;
       wake = undefined;
       resolve?.();
     };
     socket.addEventListener("message", (event) => {
-      try {
-        const messages = JSON.parse(event.data ?? "[]") as Array<Record<string, unknown>>;
-        for (const message of messages) {
-          if (message.T === "success" && message.msg === "connected") {
-            socket.send(JSON.stringify({ action: "auth", key: this.config.apiKeyId, secret: this.config.apiSecretKey }));
-          } else if (message.T === "success" && message.msg === "authenticated") {
-            socket.send(JSON.stringify({ action: "subscribe", bars: [this.config.symbol] }));
-          } else if (message.T === "error") {
-            failure = new AlpacaTransportError(
-              Number(message.code) === 402 ? "AUTHENTICATION_FAILURE" : "UNSUPPORTED_DATA_FEED",
-              String(message.msg ?? "Alpaca data-stream error."),
-            );
-          } else {
-            const bar = closedBarFromAlpaca(message as unknown as AlpacaStockBarMessage, this.now());
-            if (bar) queue.push(bar);
+      messageQueue = messageQueue.then(async () => {
+        try {
+          const messages = JSON.parse(await websocketPayloadToText(event.data)) as Array<Record<string, unknown>>;
+          for (const message of messages) {
+            if (message.T === "success" && message.msg === "connected") {
+              socket.send(JSON.stringify({ action: "auth", key: this.config.apiKeyId, secret: this.config.apiSecretKey }));
+            } else if (message.T === "success" && message.msg === "authenticated") {
+              socket.send(JSON.stringify({ action: "subscribe", bars: [this.config.symbol] }));
+            } else if (message.T === "error") {
+              failure = new AlpacaTransportError(
+                Number(message.code) === 402 ? "AUTHENTICATION_FAILURE" : "UNSUPPORTED_DATA_FEED",
+                String(message.msg ?? "Alpaca data-stream error."),
+              );
+            } else {
+              const bar = closedBarFromAlpaca(message as unknown as AlpacaStockBarMessage, this.now());
+              if (bar) queue.push(bar);
+            }
           }
+        } catch {
+          failure = new AlpacaTransportError("DISCONNECTED_STREAM", "Invalid Alpaca stream message.");
         }
-      } catch {
-        failure = new AlpacaTransportError("DISCONNECTED_STREAM", "Invalid Alpaca stream message.");
-      }
-      signal();
+        signal();
+      });
+      return messageQueue;
     });
     socket.addEventListener("error", () => {
       failure = new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca data stream disconnected.");
@@ -344,25 +356,75 @@ export class AlpacaPaperTradeUpdates {
     this.createSocket = createSocket;
   }
 
-  connect(onUpdate: (update: Record<string, unknown>) => void, onError: (error: Error) => void): () => void {
+  /**
+   * `onReady` is intentionally delayed until Alpaca's `listening` acknowledgement
+   * includes `trade_updates`; an open socket or an authorized session alone is
+   * not a subscribed trade-update stream.
+   */
+  connect(
+    onUpdate: (update: Record<string, unknown>) => void,
+    onError: (error: Error) => void,
+    onReady: () => void,
+  ): () => void {
     const socket = this.createSocket(ALPACA_PAPER_TRADE_STREAM_URL);
+    let authSent = false;
+    let authorized = false;
+    let listenSent = false;
+    let ready = false;
+    let failed = false;
+    let messageQueue = Promise.resolve();
+    const fail = (error: Error) => {
+      if (failed) return;
+      failed = true;
+      onError(error);
+    };
     socket.addEventListener("message", (event) => {
-      try {
-        const update = JSON.parse(event.data ?? "{}") as Record<string, unknown>;
-        if (update.stream === "authorization") {
-          const data = update.data as Record<string, unknown> | undefined;
-          if (data?.status === "unauthorized") {
-            onError(new AlpacaTransportError("AUTHENTICATION_FAILURE", "Alpaca paper trade stream authentication failed."));
-          } else if (data?.status === "authorized") {
-            socket.send(JSON.stringify({ action: "listen", data: { streams: ["trade_updates"] } }));
+      messageQueue = messageQueue.then(async () => {
+        try {
+          const update = JSON.parse(await websocketPayloadToText(event.data)) as Record<string, unknown>;
+          if (update.stream === "authorization") {
+            const data = update.data as Record<string, unknown> | undefined;
+            if (data?.status === "unauthorized") {
+              fail(new AlpacaTransportError("AUTHENTICATION_FAILURE", "Alpaca paper trade stream authentication failed."));
+            } else if (data?.status === "authorized") {
+              authorized = true;
+              if (!listenSent) {
+                listenSent = true;
+                socket.send(JSON.stringify({ action: "listen", data: { streams: ["trade_updates"] } }));
+              }
+            }
+          } else if (update.stream === "listening") {
+            const streams = (update.data as Record<string, unknown> | undefined)?.streams;
+            if (!authorized || !listenSent || !Array.isArray(streams) || !streams.includes("trade_updates")) {
+              fail(new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca paper trade_updates subscription was not acknowledged."));
+            } else if (!ready) {
+              ready = true;
+              onReady();
+            }
+          } else if (update.stream === "trade_updates") {
+            if (!ready) {
+              fail(new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca paper trade update arrived before subscription readiness."));
+            } else {
+              onUpdate(update);
+            }
           }
-        } else if (update.stream === "trade_updates") onUpdate(update);
-      } catch {
-        onError(new AlpacaTransportError("DISCONNECTED_STREAM", "Invalid Alpaca paper trade update."));
-      }
+        } catch {
+          fail(new AlpacaTransportError("DISCONNECTED_STREAM", "Invalid Alpaca paper trade update."));
+        }
+      });
+      return messageQueue;
     });
-    socket.addEventListener("error", () => onError(new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca paper trade stream disconnected.")));
-    socket.send(JSON.stringify({ action: "auth", key: this.config.apiKeyId, secret: this.config.apiSecretKey }));
+    socket.addEventListener("error", () => fail(new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca paper trade stream disconnected.")));
+    socket.addEventListener("close", () => fail(new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca paper trade stream closed.")));
+    socket.addEventListener("open", () => {
+      if (authSent) return;
+      authSent = true;
+      socket.send(JSON.stringify({
+        action: "auth",
+        key: this.config.apiKeyId,
+        secret: this.config.apiSecretKey,
+      }));
+    });
     return () => socket.close();
   }
 }

@@ -63,7 +63,10 @@ export class SqlAlpacaWorkerStore implements AlpacaWorkerStore {
 
   async updateRun(runId: string, state: string, haltReason: string | null): Promise<void> {
     const sql = await getWorkerSql();
-    await sql.query("update worker_runs set state = $2, halt_reason = $3, stopped_at = case when $2 in ('STOPPED', 'HALTED') then $4 else null end where run_id = $1", [runId, state, haltReason, nowIso()]);
+    await sql.query(
+      "update worker_runs set state = $2, halt_reason = $3, stopped_at = case when $2 in ('STOPPED', 'HALTED') then now() else null end where run_id = $1",
+      [runId, state, haltReason],
+    );
   }
 
   async insertClosedBar(symbol: string, bar: ClosedBar): Promise<boolean> {
