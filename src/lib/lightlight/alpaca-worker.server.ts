@@ -629,8 +629,18 @@ export class AlpacaPaperWorker {
 
 const globalRef = globalThis as typeof globalThis & { __alpacaPaperWorker__?: Promise<AlpacaPaperWorker> };
 
-/** Runtime singleton: React requests observe one worker, never create one each. */
+/**
+ * Runtime singleton for the explicitly launched worker process.
+ *
+ * Vercel serves the web application and read-only runtime views only. Its
+ * request/function lifecycle cannot own the session-long market and
+ * trade-update streams, so fail closed before configuration, database, or
+ * socket initialization if this factory is ever reached there.
+ */
 export function getAlpacaPaperWorker(): Promise<AlpacaPaperWorker> {
+  if (process.env.VERCEL === "1") {
+    throw new Error("ALPACA_WORKER_FORBIDDEN_ON_VERCEL");
+  }
   globalRef.__alpacaPaperWorker__ ??= (async () => {
     const config = loadAlpacaConfig();
     const worker = new AlpacaPaperWorker({

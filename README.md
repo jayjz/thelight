@@ -91,6 +91,13 @@ The worker and smoke commands are intentionally excluded from CI. See the
 [Alpaca PAPER worker guide](docs/ALPACA_PAPER_WORKER.md) for operator controls,
 the explicit dispatch procedure, and its fail-closed recovery behavior.
 
+## Web deployment boundary
+
+Vercel serves the UI and web-server boundary only. The persistent Alpaca PAPER
+worker belongs on a separate always-on host and is never started by a Vercel
+build, request, or server function. See the [Vercel deployment guide](docs/VERCEL_DEPLOYMENT.md)
+for the environment-variable matrix and deployment procedure.
+
 ## Limitations
 
 - PAPER only; no live-money execution path.
@@ -108,6 +115,8 @@ the explicit dispatch procedure, and its fail-closed recovery behavior.
   provenance, and immutability.
 - [Alpaca PAPER worker](docs/ALPACA_PAPER_WORKER.md) — authority, reconciliation,
   persistence, and operator controls.
+- [Vercel deployment](docs/VERCEL_DEPLOYMENT.md) — web/worker boundary and
+  deployment environment contract.
 - [Execution model](docs/EXECUTION_MODEL.md) — causal fills, accounting, and
   unknown execution state.
 - [Roadmap](docs/ROADMAP.md) — research milestones and known work remaining.
