@@ -6,3 +6,5 @@ node_modules/
 !.env.example
 
 repomix-output.xml
+
+.vercel/output/

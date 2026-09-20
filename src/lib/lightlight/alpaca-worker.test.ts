@@ -68,11 +68,39 @@ class FakeBroker {
 class FakeTradeUpdates {
   onUpdate: ((update: Record<string, unknown>) => void) | null = null;
   onError: ((error: Error) => void) | null = null;
+  onReady: (() => void) | null = null;
   connects = 0;
-  connect(onUpdate: (update: Record<string, unknown>) => void, onError: (error: Error) => void): () => void {
-    this.connects += 1; this.onUpdate = onUpdate; this.onError = onError;
-    return () => { this.onUpdate = null; this.onError = null; };
+  readyOnConnect = true;
+  failSynchronously = false;
+  readonly connections: Array<{
+    onUpdate: (update: Record<string, unknown>) => void;
+    onError: (error: Error) => void;
+    onReady: () => void;
+    active: boolean;
+  }> = [];
+
+  connect(
+    onUpdate: (update: Record<string, unknown>) => void,
+    onError: (error: Error) => void,
+    onReady: () => void,
+  ): () => void {
+    this.connects += 1;
+    const connection = { onUpdate, onError, onReady, active: true };
+    this.connections.push(connection);
+    this.onUpdate = onUpdate; this.onError = onError; this.onReady = onReady;
+    if (this.readyOnConnect) onReady();
+    if (this.failSynchronously) onError(new Error("TRADE_SOCKET_SYNCHRONOUS_FAILURE"));
+    return () => {
+      connection.active = false;
+      if (this.onUpdate === onUpdate) {
+        this.onUpdate = null;
+        this.onError = null;
+        this.onReady = null;
+      }
+    };
   }
+
+  failLatest(): void { this.connections.at(-1)?.onError(new Error("TRADE_SOCKET_FAILURE")); }
 }
 
 function rawBars(decisionBuckets = 28): Array<{ t: number; open: number; high: number; low: number; close: number; volume: number }> {
@@ -214,19 +242,106 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
   });
 
   it("persists trade updates, reconciles after stream loss, and never dispatches outside the exchange session", async () => {
-    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const updates = new FakeTradeUpdates(); const target = worker(store, broker, updates);
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const updates = new FakeTradeUpdates();
+    const target = new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, isRegularSession: () => true, sleep: async () => undefined });
     await runToDispatch(target, broker);
     const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
     await target.processTradeUpdate({ stream: "trade_updates", data: { event: "fill", order: { id: "broker-1", status: "filled", client_order_id: accepted.clientOrderId } } });
     assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
     const accountCalls = broker.accountCalls;
     await target.handleTradeStreamError(new Error("socket lost"));
+    await flush();
     assert.ok(broker.accountCalls > accountCalls); assert.ok(updates.connects >= 2);
 
     const outStore = new MemoryAlpacaWorkerStore(); const outBroker = new FakeBroker(); const outside = worker(outStore, outBroker, undefined, false);
     await outside.start(); for (const bar of rawBars()) await outside.processRawBar(bar);
     assert.equal(outBroker.posts, 0);
     assert.ok((await outStore.listIntents()).some((row) => row.dispatchBlockReason === "OUTSIDE_REGULAR_SESSION"));
+  });
+
+  it("bounds trade-stream recovery, reconciles before replacement, and preserves decision/submission idempotency", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const updates = new FakeTradeUpdates();
+    const backoffs: Array<{ delay: number; resolve: () => void }> = [];
+    const target = new AlpacaPaperWorker({
+      config, store, broker, tradeUpdates: updates, isRegularSession: () => true,
+      reconnectDelayMs: (attempt) => attempt * 10,
+      sleep: (delay) => new Promise<void>((resolve) => { backoffs.push({ delay, resolve }); }),
+    });
+    await runToDispatch(target, broker);
+    const decisions = store.decisionCount(); const posts = broker.posts;
+    const reconciliations = broker.accountCalls;
+
+    updates.failLatest();
+    updates.failLatest();
+    await flush(); await flush();
+    assert.ok(broker.accountCalls > reconciliations, "trade loss reconciles before scheduling replacement");
+    assert.equal(updates.connects, 1, "no replacement is created before backoff completes");
+    assert.deepEqual(backoffs.map(({ delay }) => delay), [10], "only one reconnect is pending");
+
+    backoffs[0]!.resolve();
+    await flush(); await flush();
+    assert.equal(updates.connects, 2);
+    updates.failLatest();
+    await flush(); await flush();
+    assert.deepEqual(backoffs.map(({ delay }) => delay), [10, 20], "trade backoff is bounded and increments per attempt");
+    backoffs[1]!.resolve();
+    await flush(); await flush();
+    assert.equal(updates.connects, 3);
+    for (const bar of rawBars()) await target.processRawBar(bar);
+    assert.equal(store.decisionCount(), decisions, "reconnects cannot duplicate deterministic decisions");
+    assert.equal(broker.posts, posts, "reconnects cannot duplicate broker submissions");
+    await target.stop();
+  });
+
+  it("breaks repeated synchronous trade failures across backoff turns instead of recursing", async () => {
+    const updates = new FakeTradeUpdates(); updates.failSynchronously = true;
+    const backoffs: Array<() => void> = [];
+    const target = new AlpacaPaperWorker({
+      config, store: new MemoryAlpacaWorkerStore(), broker: new FakeBroker(), tradeUpdates: updates,
+      sleep: () => new Promise<void>((resolve) => { backoffs.push(resolve); }),
+    });
+    await target.start();
+    await flush(); await flush();
+    assert.equal(updates.connects, 1);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      assert.equal(backoffs.length, attempt + 1, "each failure yields exactly one scheduled delay");
+      backoffs[attempt]!();
+      await flush(); await flush();
+      assert.equal(updates.connects, attempt + 2, "each delay, rather than the call stack, creates one replacement");
+    }
+    await target.stop();
+  });
+
+  it("invalidates pending trade reconnects on stop or halt and never reconnects after failed reconciliation", async () => {
+    const stoppedUpdates = new FakeTradeUpdates(); const stoppedBackoffs: Array<() => void> = [];
+    const stopped = new AlpacaPaperWorker({
+      config, store: new MemoryAlpacaWorkerStore(), broker: new FakeBroker(), tradeUpdates: stoppedUpdates,
+      sleep: () => new Promise<void>((resolve) => { stoppedBackoffs.push(resolve); }),
+    });
+    await stopped.start(); stoppedUpdates.failLatest(); await flush(); await flush();
+    await stopped.stop(); stoppedBackoffs[0]!(); await flush(); await flush();
+    assert.equal(stoppedUpdates.connects, 1, "stop during trade backoff cannot create a replacement socket");
+
+    const haltedBroker = new FakeBroker(); const haltedUpdates = new FakeTradeUpdates(); const haltedBackoffs: Array<() => void> = [];
+    const halted = new AlpacaPaperWorker({
+      config, store: new MemoryAlpacaWorkerStore(), broker: haltedBroker, tradeUpdates: haltedUpdates,
+      sleep: () => new Promise<void>((resolve) => { haltedBackoffs.push(resolve); }),
+    });
+    await halted.start(); haltedUpdates.failLatest(); await flush(); await flush();
+    haltedBroker.throwAccount = true; await halted.reconcile();
+    assert.equal(halted.snapshot().workerState, "HALTED");
+    haltedBackoffs[0]!(); await flush(); await flush();
+    assert.equal(haltedUpdates.connects, 1, "halt during trade backoff cannot create a replacement socket");
+
+    const failingBroker = new FakeBroker(); const failingUpdates = new FakeTradeUpdates(); const failedBackoffs: Array<() => void> = [];
+    const failing = new AlpacaPaperWorker({
+      config, store: new MemoryAlpacaWorkerStore(), broker: failingBroker, tradeUpdates: failingUpdates,
+      sleep: () => new Promise<void>((resolve) => { failedBackoffs.push(resolve); }),
+    });
+    await failing.start(); failingBroker.throwAccount = true; failingUpdates.failLatest(); await flush(); await flush();
+    assert.equal(failing.snapshot().workerState, "HALTED");
+    assert.equal(failingUpdates.connects, 1, "reconciliation failure must not reconnect blindly");
+    assert.deepEqual(failedBackoffs, []);
   });
 
   it("keeps decision and client-order identities stable", () => {

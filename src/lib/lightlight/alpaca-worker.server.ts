@@ -66,7 +66,12 @@ export interface WorkerBroker {
 }
 
 export interface WorkerTradeUpdates {
-  connect(onUpdate: (update: Record<string, unknown>) => void, onError: (error: Error) => void): () => void;
+  /** Called only after Alpaca has acknowledged the trade_updates subscription. */
+  connect(
+    onUpdate: (update: Record<string, unknown>) => void,
+    onError: (error: Error) => void,
+    onReady: () => void,
+  ): () => void;
 }
 
 export type AlpacaPaperWorkerOptions = {
@@ -150,6 +155,9 @@ export class AlpacaPaperWorker {
   private consuming = false;
   private marketReconnectScheduled = false;
   private marketReconnectAttempt = 0;
+  private tradeReconnectScheduled = false;
+  private tradeReconnectAttempt = 0;
+  private tradeRecoveryInFlight = false;
   private reconnectGeneration = 0;
   private requiresPaperEquityHighWaterRecovery = false;
   private stopped = false;
@@ -220,6 +228,7 @@ export class AlpacaPaperWorker {
     this.stopped = true;
     this.reconnectGeneration += 1;
     this.marketReconnectScheduled = false;
+    this.tradeReconnectScheduled = false;
     this.disconnectTradeUpdates?.();
     this.disconnectTradeUpdates = null;
     this.marketStreamState = "DISCONNECTED";
@@ -438,11 +447,27 @@ export class AlpacaPaperWorker {
   private connectTradeUpdates(): void {
     if (!this.options.tradeUpdates || this.disconnectTradeUpdates || this.stopped) return;
     this.tradeUpdateStreamState = "CONNECTING";
-    this.disconnectTradeUpdates = this.options.tradeUpdates.connect(
+    const generation = this.reconnectGeneration;
+    let failedDuringConnect = false;
+    const disconnect = this.options.tradeUpdates.connect(
       (update) => { void this.processTradeUpdate(update); },
-      (error) => { void this.handleTradeStreamError(error); },
+      (error) => {
+        failedDuringConnect = true;
+        void this.handleTradeStreamError(error);
+      },
+      () => {
+        if (generation !== this.reconnectGeneration || this.stopped || this.state !== "READY" || failedDuringConnect) return;
+        this.tradeUpdateStreamState = "CONNECTED";
+        void this.persistCheckpoint();
+      },
     );
-    this.tradeUpdateStreamState = "CONNECTED";
+    // A fake or transport can report failure synchronously from connect(). Do
+    // not retain that socket or overwrite DEGRADED with CONNECTED afterwards.
+    if (failedDuringConnect) {
+      disconnect();
+      return;
+    }
+    this.disconnectTradeUpdates = disconnect;
     void this.persistCheckpoint();
   }
 
@@ -462,14 +487,33 @@ export class AlpacaPaperWorker {
   }
 
   async handleTradeStreamError(_error: Error): Promise<void> {
-    if (this.stopped || this.state === "HALTED") return;
+    if (this.stopped || this.state === "HALTED" || this.tradeRecoveryInFlight || this.tradeReconnectScheduled) return;
+    this.tradeRecoveryInFlight = true;
     this.tradeUpdateStreamState = "DEGRADED";
     this.disconnectTradeUpdates?.();
     this.disconnectTradeUpdates = null;
-    await this.persistCheckpoint();
-    // Reconciliation is required before reconnect; missed events are never assumed absent.
-    await this.reconcile();
-    if (this.state === "READY" && !this.stopped) this.connectTradeUpdates();
+    try {
+      await this.persistCheckpoint();
+      // Reconciliation is required before reconnect; missed events are never assumed absent.
+      await this.reconcile();
+      if (this.state === "READY" && !this.stopped) this.scheduleTradeReconnect();
+    } finally {
+      this.tradeRecoveryInFlight = false;
+    }
+  }
+
+  private scheduleTradeReconnect(): void {
+    if (!this.options.tradeUpdates || this.tradeReconnectScheduled || this.stopped || this.state !== "READY") return;
+    this.tradeReconnectScheduled = true;
+    const generation = this.reconnectGeneration;
+    const attempt = ++this.tradeReconnectAttempt;
+    const delay = Math.max(0, this.options.reconnectDelayMs?.(attempt) ?? Math.min(30_000, 250 * 2 ** (attempt - 1)));
+    void (async () => {
+      await (this.options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds))))(delay);
+      this.tradeReconnectScheduled = false;
+      if (generation !== this.reconnectGeneration || this.stopped || this.state !== "READY") return;
+      this.connectTradeUpdates();
+    })();
   }
 
   private startMarketConsumer(): void {
@@ -567,6 +611,7 @@ export class AlpacaPaperWorker {
     this.state = "HALTED";
     this.reconnectGeneration += 1;
     this.marketReconnectScheduled = false;
+    this.tradeReconnectScheduled = false;
     this.checkpoint.haltReason = reason;
     this.marketStreamState = "DEGRADED";
     this.tradeUpdateStreamState = "DEGRADED";
