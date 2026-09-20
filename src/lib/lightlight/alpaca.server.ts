@@ -454,7 +454,7 @@ export class AlpacaPaperExecution implements ExecutionPort {
     const clientOrderId = intent.clientOrderId ?? intent.intentId;
     const response = await this.request(
       `${ALPACA_PAPER_BASE_URL}/v2/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`,
-      { headers: alpacaHeaders(this.config) },
+      { headers: alpacaHeaders(this.config), signal: AbortSignal.timeout(25_000) },
     );
     if (response.status === 404) {
       const uncertain = intent.status === "UNKNOWN" || this.uncertainClientOrderIds.has(clientOrderId);
@@ -493,6 +493,7 @@ export class AlpacaPaperExecution implements ExecutionPort {
       const response = await this.request(`${ALPACA_PAPER_BASE_URL}/v2/orders`, {
         method: "POST",
         headers: { ...alpacaHeaders(this.config), "content-type": "application/json" },
+        signal: AbortSignal.timeout(25_000),
         body: JSON.stringify({
           symbol: this.config.symbol,
           qty: String(Math.abs(delta)),

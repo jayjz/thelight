@@ -282,6 +282,12 @@ PaperBrokerExecutionEngine
 
 No live-money execution belongs in the current architecture.
 
+For the bounded Alpaca PAPER engine, Postgres is also the dispatch-authority
+boundary: exactly one unexpired, fenced lease for the worker key may mark a
+pending intent `SUBMISSION_ATTEMPTED` or enter the final broker-submit guard.
+The broker remains authoritative for execution truth; the fence only prevents
+multiple worker processes from possessing submission authority.
+
 9. Execution ledger
 
 There must be one canonical source of truth for:

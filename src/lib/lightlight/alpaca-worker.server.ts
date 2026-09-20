@@ -12,7 +12,7 @@ import {
   type OpenBrokerOrder,
   type SubmissionRecovery,
 } from "./alpaca.server.ts";
-import { MemoryAlpacaWorkerStore, SqlAlpacaWorkerStore, type AlpacaWorkerStore, type WorkerCheckpoint } from "./alpaca-worker-store.server.ts";
+import { MemoryAlpacaWorkerStore, SqlAlpacaWorkerStore, type AlpacaWorkerStore, type WorkerCheckpoint, type WorkerLease } from "./alpaca-worker-store.server.ts";
 import { computeFeatures } from "./features.ts";
 import { buildJevRequest, createMockJevAdapter } from "./jev.ts";
 import type { MarketSource } from "./market.ts";
@@ -23,6 +23,8 @@ import type { ClosedBar, Evidence, ExecutionIntent, ExecutionStatus } from "./ty
 export const ALPACA_WORKER_SYMBOL = "SPY";
 export const ALPACA_WORKER_TIMEFRAME = "15Min";
 export const ALPACA_WORKER_CONFIG_VERSION = "alpaca-paper-worker-v1";
+const OWNERSHIP_LEASE_SECONDS = 30;
+const OWNERSHIP_RENEW_INTERVAL_MS = 10_000;
 
 export type WorkerState = "STOPPED" | "STARTING" | "RECONCILING" | "READY" | "HALTED";
 export type WorkerStreamState = "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "DEGRADED" | "RECONCILING";
@@ -151,6 +153,9 @@ export class AlpacaPaperWorker {
   private riskState: string | null = null;
   private missingDecisionBuckets = 0;
   private runId: string | null = null;
+  private ownership: WorkerLease | null = null;
+  private ownershipTimer: ReturnType<typeof setInterval> | null = null;
+  private ownershipGeneration = 0;
   private disconnectTradeUpdates: (() => void) | null = null;
   private consuming = false;
   private marketReconnectScheduled = false;
@@ -202,7 +207,21 @@ export class AlpacaPaperWorker {
       this.checkpoint.haltReason = "DURABLE_STORAGE_REQUIRED";
       return;
     }
-    await this.options.store.createRun(this.runId, this.state);
+    await this.options.store.createRun(this.runId, this.key, this.state);
+    const ownership = await this.options.store.acquireOwnership(this.key, this.runId, OWNERSHIP_LEASE_SECONDS);
+    if (!ownership) {
+      // A live process already owns the durable lease. Do not write the shared
+      // checkpoint or initialize streams from this losing process.
+      this.state = "HALTED";
+      this.marketStreamState = "DEGRADED";
+      this.tradeUpdateStreamState = "DEGRADED";
+      this.checkpoint.haltReason = "DISPATCH_OWNERSHIP_UNAVAILABLE";
+      await this.options.store.updateRun(this.runId, this.state, this.checkpoint.haltReason);
+      return;
+    }
+    this.ownership = ownership;
+    this.ownershipGeneration += 1;
+    this.startOwnershipRenewal();
     const storedCheckpoint = await this.options.store.readCheckpoint(this.key);
     this.requiresPaperEquityHighWaterRecovery = storedCheckpoint !== null &&
       (typeof storedCheckpoint.paperEquityHighWater !== "number" || !Number.isFinite(storedCheckpoint.paperEquityHighWater));
@@ -225,7 +244,9 @@ export class AlpacaPaperWorker {
   }
 
   async stop(): Promise<void> {
+    const owned = this.ownership !== null;
     this.stopped = true;
+    this.stopOwnershipRenewal();
     this.reconnectGeneration += 1;
     this.marketReconnectScheduled = false;
     this.tradeReconnectScheduled = false;
@@ -234,8 +255,9 @@ export class AlpacaPaperWorker {
     this.marketStreamState = "DISCONNECTED";
     this.tradeUpdateStreamState = "DISCONNECTED";
     this.state = "STOPPED";
-    await this.persistCheckpoint();
+    if (owned) await this.persistCheckpoint();
     if (this.runId) await this.options.store.updateRun(this.runId, this.state, null);
+    await this.releaseOwnership();
   }
 
   /** Server/CLI operator control. It never authorizes unknown resubmission. */
@@ -395,10 +417,29 @@ export class AlpacaPaperWorker {
     const reconciled = await this.options.broker.reconcile(intent);
     await this.recordBrokerState(intent, reconciled);
     if (reconciled.lookup === "FOUND" || reconciled.status === "UNKNOWN" || reconciled.status !== "PENDING") return;
+    const ownership = this.ownership;
+    if (!ownership) throw new Error("DISPATCH_OWNERSHIP_REQUIRED");
     // This durable marker closes the crash window after a broker POST begins.
-    // Restart reconciliation never treats it as fresh permission to resubmit.
-    await this.options.store.putIntent({ ...intent, status: "SUBMISSION_ATTEMPTED" });
-    const submitted = await this.options.broker.submit({ ...intent, status: reconciled.status }, position);
+    // It is also a conditional, fenced claim: an old owner cannot change it.
+    if (!await this.options.store.claimIntentForDispatch(ownership, intent)) {
+      await this.loseOwnership("DISPATCH_OWNERSHIP_LOST");
+      throw new Error("DISPATCH_OWNERSHIP_LOST");
+    }
+    // Revalidate immediately before POST while holding the lease-row lock.
+    // A takeover either happened first (no POST) or waits until this bounded
+    // call completes; the broker cannot participate in a SQL transaction.
+    const submitted = await this.options.store.withDispatchAuthority(
+      ownership,
+      intent.intentId,
+      // The durable store owns the submission marker. The broker adapter needs
+      // its pre-POST reconciliation view to remain PENDING so it can perform
+      // the one authorized POST rather than treating the marker as a retry.
+      () => this.options.broker.submit({ ...intent, status: "PENDING" }, position),
+    );
+    if (!submitted) {
+      await this.loseOwnership("DISPATCH_OWNERSHIP_LOST");
+      throw new Error("DISPATCH_OWNERSHIP_LOST");
+    }
     await this.recordBrokerState(intent, submitted);
     if (submitted.status === "UNKNOWN") await this.halt("UNKNOWN_SUBMISSION_REQUIRES_RECOVERY");
   }
@@ -607,8 +648,74 @@ export class AlpacaPaperWorker {
     };
   }
 
-  private async halt(reason: string): Promise<void> {
+  private startOwnershipRenewal(): void {
+    this.stopOwnershipRenewal();
+    const generation = this.ownershipGeneration;
+    this.ownershipTimer = setInterval(() => {
+      void this.renewOwnership(generation);
+    }, OWNERSHIP_RENEW_INTERVAL_MS);
+    this.ownershipTimer.unref?.();
+  }
+
+  private stopOwnershipRenewal(): void {
+    if (this.ownershipTimer) clearInterval(this.ownershipTimer);
+    this.ownershipTimer = null;
+  }
+
+  private async renewOwnership(generation: number): Promise<void> {
+    if (generation !== this.ownershipGeneration || this.stopped || this.state === "HALTED") return;
+    const ownership = this.ownership;
+    if (!ownership) return;
+    try {
+      const renewed = await this.options.store.renewOwnership(ownership, OWNERSHIP_LEASE_SECONDS);
+      if (!renewed) await this.loseOwnership("DISPATCH_OWNERSHIP_LOST");
+      else if (generation === this.ownershipGeneration) this.ownership = renewed;
+    } catch {
+      // A database ambiguity is never dispatch permission. Stop local streams
+      // without attempting a checkpoint write that could overwrite the new owner.
+      await this.loseOwnership("DISPATCH_OWNERSHIP_RENEWAL_FAILED");
+    }
+  }
+
+  private async releaseOwnership(): Promise<void> {
+    const ownership = this.ownership;
+    this.ownership = null;
+    this.ownershipGeneration += 1;
+    if (!ownership) return;
+    try {
+      await this.options.store.releaseOwnership(ownership);
+    } catch {
+      // Expiry is the recovery mechanism. A failed graceful release cannot
+      // restore authority or make a crashed owner permanent.
+    }
+  }
+
+  private async loseOwnership(reason: string): Promise<void> {
+    if (this.state === "HALTED" && !this.ownership) return;
+    this.ownership = null;
+    this.ownershipGeneration += 1;
+    this.stopOwnershipRenewal();
+    this.stopped = true;
+    this.reconnectGeneration += 1;
+    this.marketReconnectScheduled = false;
+    this.tradeReconnectScheduled = false;
+    this.disconnectTradeUpdates?.();
+    this.disconnectTradeUpdates = null;
     this.state = "HALTED";
+    this.marketStreamState = "DEGRADED";
+    this.tradeUpdateStreamState = "DEGRADED";
+    this.checkpoint.haltReason = reason;
+    // Deliberately no checkpoint mutation after authority is lost.
+    if (this.runId) await this.options.store.updateRun(this.runId, this.state, reason);
+  }
+
+  private async halt(reason: string): Promise<void> {
+    if (!this.ownership) {
+      await this.loseOwnership(reason);
+      return;
+    }
+    this.state = "HALTED";
+    this.stopOwnershipRenewal();
     this.reconnectGeneration += 1;
     this.marketReconnectScheduled = false;
     this.tradeReconnectScheduled = false;
@@ -617,13 +724,19 @@ export class AlpacaPaperWorker {
     this.tradeUpdateStreamState = "DEGRADED";
     await this.persistCheckpoint();
     if (this.runId) await this.options.store.updateRun(this.runId, this.state, reason);
+    await this.releaseOwnership();
   }
 
   private async persistCheckpoint(): Promise<void> {
     this.checkpoint.streamState = this.marketStreamState;
     this.checkpoint.marketStreamState = this.marketStreamState;
     this.checkpoint.tradeUpdateStreamState = this.tradeUpdateStreamState;
-    await this.options.store.writeCheckpoint(this.key, this.checkpoint);
+    const ownership = this.ownership;
+    if (!ownership) throw new Error("DISPATCH_OWNERSHIP_REQUIRED");
+    if (!await this.options.store.writeCheckpointOwned(ownership, this.checkpoint)) {
+      await this.loseOwnership("DISPATCH_OWNERSHIP_LOST");
+      throw new Error("DISPATCH_OWNERSHIP_LOST");
+    }
   }
 }
 
