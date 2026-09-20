@@ -2,14 +2,15 @@ import { generateSyntheticCandles } from "./candles.ts";
 import { computeFeatures } from "./features.ts";
 import { buildJevRequest, createMockJevAdapter, type JevAdapter } from "./jev.ts";
 import {
-  actionToPosition,
   classifyDeterministicRegime,
   evaluatePolicy,
   evaluateRisk,
   evaluateSignal,
 } from "./policy.ts";
 import { computeJevMetrics, computePathMetrics } from "./evaluate.ts";
-import { STRATEGY_VERSION } from "./thresholds.ts";
+import { ReplayExecution } from "./execution.ts";
+import type { MarketSource } from "./market.ts";
+import { STRATEGY_VERSION, THRESHOLDS } from "./thresholds.ts";
 import {
   SYMBOL,
   TIMEFRAME,
@@ -17,13 +18,13 @@ import {
   type Candle,
   type Evidence,
   type ExperimentArm,
-  type PaperFill,
   type SessionResult,
   type StrategyId,
+  type TradingMode,
 } from "./types.ts";
 
 export function assertPaperOnly(mode: string): void {
-  if (mode !== TRADING_MODE) {
+  if (mode !== "PAPER_REPLAY" && mode !== "ALPACA_PAPER") {
     throw new Error("LIVE_TRADING_FORBIDDEN");
   }
 }
@@ -42,19 +43,24 @@ export function runSession(input: {
   strategyId: StrategyId;
   candles?: Candle[];
   adapter?: JevAdapter;
+  execution?: { transactionCostBps: number; slippageBps: number };
+  tradingMode?: TradingMode;
 }): SessionResult {
-  assertPaperOnly(TRADING_MODE);
+  const tradingMode = input.tradingMode ?? TRADING_MODE;
+  assertPaperOnly(tradingMode);
   const candles = input.candles ?? generateSyntheticCandles();
   const adapter = input.adapter ?? createMockJevAdapter();
   const features = computeFeatures(candles);
   const evidences: Evidence[] = [];
-  const fills: PaperFill[] = [];
-
-  let position = 0;
-  let equity = 1;
-  let peak = 1;
+  const execution = new ReplayExecution(
+    input.execution ?? {
+      transactionCostBps: THRESHOLDS.transactionCostBps,
+      slippageBps: THRESHOLDS.slippageBps,
+    },
+  );
 
   for (let i = 0; i < candles.length; i++) {
+    execution.advanceBar(i, candles[i]!, candles[i - 1]);
     const f = features[i]!;
     const signal = evaluateSignal(input.strategyId, f);
     const detRegime = classifyDeterministicRegime(f);
@@ -67,14 +73,12 @@ export function runSession(input: {
       detRegime,
       jev: jevResponse,
     });
-    const equityDd = peak === 0 ? 0 : Math.max(0, (peak - equity) / peak);
     const risk = evaluateRisk({
       desired: policy.desired,
       features: f,
-      equityDrawdown: equityDd,
+      equityDrawdown: execution.currentDrawdown,
     });
     const action = risk.target;
-    const pos = actionToPosition(action);
     const abstained =
       policy.desired !== action ||
       (action === "FLAT" && signal.desired !== "FLAT");
@@ -86,7 +90,7 @@ export function runSession(input: {
       barIndex: i,
       symbol: SYMBOL,
       timeframe: TIMEFRAME,
-      tradingMode: TRADING_MODE,
+      tradingMode,
       marketSnapshot: candles[i]!,
       features: f,
       strategyId: input.strategyId,
@@ -99,38 +103,28 @@ export function runSession(input: {
       policy,
       risk,
       action,
-      positionAfter: pos,
+      targetPosition: action === "LONG" ? 1 : action === "SHORT" ? -1 : 0,
       abstained,
     };
     evidences.push(ev);
-
-    if (pos !== position && i + 1 < candles.length) {
-      fills.push({
-        decisionId: id,
-        barIndex: i,
-        fillBarIndex: i + 1,
-        action,
-        positionAfter: pos,
-        fillPrice: candles[i + 1]!.close,
-        note: "UNCALIBRATED next-bar close fill. Paper only.",
-      });
-    }
-
-    if (i + 1 < candles.length) {
-      const r = Math.log(candles[i + 1]!.close / candles[i]!.close);
-      equity *= Math.exp(position * r);
-      if (equity > peak) peak = equity;
-    }
-    position = pos;
+    execution.createIntent({
+      decisionId: id,
+      createdAtBar: i,
+      createdAtTimestamp: f.timestamp,
+      action,
+    });
   }
+
+  const ledger = execution.snapshot();
 
   return {
     arm: input.arm,
     strategyId: input.strategyId,
     candles,
     evidences,
-    fills,
-    metrics: computePathMetrics(candles, evidences),
+    ledger,
+    fills: ledger.fills,
+    metrics: computePathMetrics(candles, evidences, ledger, input.execution),
     jevMetrics: computeJevMetrics(candles, evidences),
   };
 }
@@ -145,4 +139,13 @@ export function runAllArms(strategyId: StrategyId, candles?: Candle[]) {
       runSession({ arm, strategyId, candles: series, adapter }),
     ]),
   ) as Record<ExperimentArm, SessionResult>;
+}
+
+/** Runs a finite closed-bar source through exactly the same decision pipeline. */
+export async function runSessionFromMarketSource(
+  input: Omit<Parameters<typeof runSession>[0], "candles"> & { source: MarketSource },
+): Promise<SessionResult> {
+  const candles: Candle[] = [];
+  for await (const bar of input.source.bars()) candles.push(bar);
+  return runSession({ ...input, candles });
 }

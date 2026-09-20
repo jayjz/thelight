@@ -16,7 +16,8 @@
     "preview:stop": "node scripts/preview.mjs stop",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts src/lib/lightlight/features.test.ts src/lib/lightlight/pipeline.test.ts src/lib/lightlight/jev.test.ts src/lib/lightlight/policy.test.ts",
+    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts src/lib/lightlight/features.test.ts src/lib/lightlight/pipeline.test.ts src/lib/lightlight/jev.test.ts src/lib/lightlight/policy.test.ts src/lib/lightlight/execution.test.ts src/lib/lightlight/alpaca.test.ts",
+    "alpaca:smoke": "node scripts/alpaca-paper-smoke.mjs",
     "lint": "eslint .",
     "format": "prettier --write ."
   },

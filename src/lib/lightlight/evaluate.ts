@@ -1,65 +1,27 @@
 import { THRESHOLDS } from "./thresholds.ts";
 import { sampleStd } from "./features.ts";
 import type {
-  Action,
   Candle,
   Evidence,
+  ExecutionLedger,
   JevEvalMetrics,
   PathMetrics,
 } from "./types.ts";
 
-function positionOf(action: Action): number {
-  if (action === "LONG") return 1;
-  if (action === "SHORT") return -1;
-  return 0;
-}
-
 export function computePathMetrics(
   candles: Candle[],
   evidences: Evidence[],
+  ledger: ExecutionLedger,
+  execution: { transactionCostBps: number; slippageBps: number } = THRESHOLDS,
 ): PathMetrics {
-  const byBar = new Map<number, Evidence>();
-  for (const e of evidences) byBar.set(e.barIndex, e);
-
-  const rets: number[] = [];
-  let equity = 1;
+  // Decision evidence explains an intent; it is never used to rebuild a
+  // position here. The ledger is the sole accounting chronology.
+  const rets = ledger.equity.slice(1).map((point) => point.periodReturn);
   let peak = 1;
   let maxDd = 0;
-  let turnover = 0;
-  let exposure = 0;
-  let prevPos = 0;
-  let tradeCount = 0;
-  let wins = 0;
-  let rounds = 0;
-  let roundPnl = 0;
-  let inTrade: Action = "FLAT";
-
-  const cost = THRESHOLDS.transactionCostBps / 10_000;
-
-  for (let i = 1; i < candles.length; i++) {
-    const prev = candles[i - 1]!;
-    const r = Math.log(candles[i]!.close / prev.close);
-    const ev = byBar.get(i - 1);
-    const pos = ev ? positionOf(ev.action) : 0;
-    const delta = Math.abs(pos - prevPos);
-    turnover += delta;
-    if (delta > 0) {
-      if (inTrade !== "FLAT") {
-        rounds += 1;
-        if (roundPnl > 0) wins += 1;
-        roundPnl = 0;
-      }
-      inTrade = ev?.action ?? "FLAT";
-      tradeCount += 1;
-    }
-    const net = pos * r - cost * delta;
-    equity *= Math.exp(net);
-    roundPnl += net;
-    rets.push(net);
-    exposure += Math.abs(pos);
-    if (equity > peak) peak = equity;
-    maxDd = Math.max(maxDd, peak === 0 ? 0 : (peak - equity) / peak);
-    prevPos = pos;
+  for (const point of ledger.equity) {
+    peak = Math.max(peak, point.equity);
+    maxDd = Math.max(maxDd, peak === 0 ? 0 : (peak - point.equity) / peak);
   }
 
   const mu = rets.length ? rets.reduce((a, b) => a + b, 0) / rets.length : 0;
@@ -68,22 +30,28 @@ export function computePathMetrics(
   const ann = Math.sqrt(252);
   const sharpe = sd > 0 ? (mu / sd) * ann : null;
   const sortino = down > 0 ? (mu / down) * ann : null;
-  const T = Math.max(1, candles.length - 1);
+  const T = Math.max(1, ledger.equity.length - 1);
+  const turnover = ledger.transitions.reduce((sum, transition) => sum + transition.turnover, 0);
+  const exposure = ledger.equity
+    .slice(1)
+    .reduce((sum, point) => sum + Math.abs(point.positionApplied), 0);
 
   return {
     barCount: candles.length,
-    tradeCount,
-    hitRate: rounds > 0 ? wins / rounds : null,
-    totalReturn: equity - 1,
+    tradeCount: ledger.transitions.length,
+    hitRate: null,
+    totalReturn: ledger.finalEquity - 1,
     sharpe,
     sortino,
     maxDrawdown: maxDd,
     turnover: turnover / T,
     exposure: exposure / T,
-    transactionCostBps: THRESHOLDS.transactionCostBps,
-    slippageBps: THRESHOLDS.slippageBps,
+    transactionCostBps: execution.transactionCostBps,
+    slippageBps: execution.slippageBps,
+    transactionCosts: ledger.totalTransactionCost,
+    slippageCosts: ledger.totalSlippage,
     abstainedCount: evidences.filter((e) => e.abstained).length,
-    note: "In-sample on synthetic seeded candles. Not walk-forward. Not a performance claim. Costs 0 bps UNCALIBRATED.",
+    note: "In-sample on synthetic seeded candles. Metrics consume the NEXT_BAR_CLOSE execution ledger. Not walk-forward or a performance claim.",
   };
 }
 
@@ -129,8 +97,8 @@ export function computeJevMetrics(
     { lo: 0.33, hi: 0.66, n: 0, hit: 0 },
     { lo: 0.66, hi: 1.01, n: 0, hit: 0 },
   ];
-  const byRegime: Record<string, { n: number; sum: number }> = {};
-  for (const k of keys) byRegime[k] = { n: 0, sum: 0 };
+  const byPredictedRegime: Record<string, { n: number; sum: number }> = {};
+  for (const k of keys) byPredictedRegime[k] = { n: 0, sum: 0 };
 
   for (const e of evidences) {
     if (!e.features.warmupComplete) continue;
@@ -169,11 +137,13 @@ export function computeJevMetrics(
       e.barIndex + 1 < candles.length
         ? Math.log(candles[e.barIndex + 1]!.close / candles[e.barIndex]!.close)
         : 0;
-    const signed = positionOf(e.action) * nxt;
-    const slot = byRegime[e.jevResponse.answers.REGIME.choice];
+    // This is a prediction diagnostic: the next market return conditional on
+    // the predicted regime. It intentionally does not apply a decision action
+    // and is not an execution or strategy-return measure.
+    const slot = byPredictedRegime[e.jevResponse.answers.REGIME.choice];
     if (slot) {
       slot.n += 1;
-      slot.sum += signed;
+      slot.sum += nxt;
     }
   }
 
@@ -217,12 +187,12 @@ export function computeJevMetrics(
     })),
     selectiveAccuracy,
     decisionsAbstained: evidences.filter((e) => e.abstained).length,
-    byRegime: Object.fromEntries(
-      Object.entries(byRegime).map(([k, v]) => [
+    byPredictedRegime: Object.fromEntries(
+      Object.entries(byPredictedRegime).map(([k, v]) => [
         k,
-        { n: v.n, meanReturn: v.n ? v.sum / v.n : 0 },
+        { n: v.n, meanNextBarMarketReturn: v.n ? v.sum / v.n : 0 },
       ]),
     ),
-    note: "Jev metrics vs our proxy regime outcome (next-5-bar return/displacement). Mock adapter, not TypeSafe Jev. Not a calibration of the live model.",
+    note: "Jev metrics vs our proxy regime outcome (next-5-bar return/displacement). byPredictedRegime is a next-bar market-outcome diagnostic, independent of fills or execution. Mock adapter, not TypeSafe Jev. Not a calibration of the live model.",
   };
 }
