@@ -19,6 +19,30 @@ connect streams or submit an order. Stop that session process with `SIGINT` or
 
 ## Authority and state
 
+Dispatch authority is durable and single-owner across processes. Before broker
+reconciliation or streams start, a process must acquire the Postgres lease for
+the worker key. The lease names its `worker_run`, has a monotonically increasing
+fencing token, and expires on PostgreSQL time (30-second lease, renewed every
+10 seconds). A concurrent process cannot acquire a live lease. After expiry or
+a graceful release, its replacement gets a higher token; the old token can no
+longer claim an intent or enter the final pre-POST guard.
+
+Immediately before a new broker POST, the current token atomically changes the
+intent from `PENDING` to durable `SUBMISSION_ATTEMPTED`. The worker then locks
+and revalidates the lease row through the bounded broker call. This serializes
+lease takeover with the unavoidable external HTTP boundary; it does not pretend
+that a broker POST is transactional with Postgres. Missing, expired,
+superseded, ambiguous, or unavailable ownership always fails closed with no
+POST.
+
+On a successful takeover, any prior non-terminal `worker_runs` for the same
+worker key become `SUPERSEDED`, with the superseding run ID, timestamp, and
+reason retained. This is crash/abandonment evidence, not a claim that the old
+process stopped gracefully. `STOPPED` and `HALTED` retain their existing
+graceful/operator and fail-closed meanings. Graceful shutdown terminalizes its
+run and makes its exact lease immediately replaceable; expiry remains the
+recovery path if it crashes.
+
 ```text
 STARTING -> RECONCILING -> READY
                     \-> HALTED
@@ -69,9 +93,14 @@ because it resets with the process.
 Decision evidence and its initial intent are inserted in one real database
 transaction (`BEGIN`, decision insert, intent insert, `COMMIT`; failure rolls
 back). A unique decision-to-intent constraint protects cardinality. Before a
-broker POST, intent state is durably marked `SUBMISSION_ATTEMPTED`; restart
-reconciles that deterministic client order identity and never treats it as new
-permission to submit again.
+broker POST, the fenced owner durably marks intent state
+`SUBMISSION_ATTEMPTED`; restart reconciles that deterministic client order
+identity and never treats it as new permission to submit again.
+
+The lease mechanism has SQL-backed concurrency coverage via
+`npm run test:alpaca-worker-ownership`. It makes no Alpaca request. Market-hours
+soak is still required to observe lease renewal and takeover behavior alongside
+real stream disconnect/reconnect timing.
 
 ## Manual smoke
 
