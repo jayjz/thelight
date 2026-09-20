@@ -163,6 +163,39 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     assert.equal(broker.posts, posts);
   });
 
+  it("halts SUBMISSION_ATTEMPTED plus absent lookup without any automatic repost", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const submitted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    await store.putIntent({ ...submitted, status: "SUBMISSION_ATTEMPTED" });
+    broker.found.delete(submitted.clientOrderId!);
+    const posts = broker.posts; const decisions = store.decisionCount();
+    await first.stop();
+
+    const recreated = worker(store, broker); await recreated.start();
+    assert.equal(recreated.snapshot().workerState, "HALTED");
+    assert.match(recreated.snapshot().haltReason ?? "", /SUBMISSION_ATTEMPTED_RECOVERY_REQUIRED/);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === submitted.intentId)?.intent.status, "SUBMISSION_ATTEMPTED");
+    assert.equal(broker.posts, posts, "absent lookup cannot authorize a second POST");
+    for (const bar of rawBars()) await recreated.processRawBar(bar);
+    assert.equal(broker.posts, posts, "HALTED blocks later dispatch");
+    assert.equal(store.decisionCount(), decisions, "HALTED blocks later decisions");
+  });
+
+  it("adopts a found SUBMISSION_ATTEMPTED broker order without reposting", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const submitted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    await store.putIntent({ ...submitted, status: "SUBMISSION_ATTEMPTED" });
+    const clientOrderId = submitted.clientOrderId!;
+    broker.found.set(clientOrderId, { decisionId: submitted.decisionId, intentId: submitted.intentId, clientOrderId, brokerOrderId: "adopted-attempt", status: "ACCEPTED", updatedAt: "2026-09-19T14:00:00.000Z", rawStatus: "accepted", lookup: "FOUND" });
+    const posts = broker.posts;
+    await first.stop(); const recreated = worker(store, broker); await recreated.start();
+    assert.equal(recreated.snapshot().workerState, "READY");
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === submitted.intentId)?.intent.status, "ACCEPTED");
+    assert.equal(broker.posts, posts);
+  });
+
   it("uses broker position, blocks failed position reconciliation, and conservatively blocks open-order conflicts", async () => {
     const positionStore = new MemoryAlpacaWorkerStore(); const positionedBroker = new FakeBroker(); positionedBroker.positionQuantity = -1;
     await runToDispatch(worker(positionStore, positionedBroker), positionedBroker);

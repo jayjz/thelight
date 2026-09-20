@@ -409,6 +409,12 @@ export class AlpacaPaperWorker {
     for (const stored of intents) {
       if (terminal(stored.intent.status)) continue;
       const state = await this.options.broker.reconcile(stored.intent);
+      // A durable pre-POST marker means the process may have crashed after the
+      // broker received the order but before its response was persisted. An
+      // absent lookup is uncertainty, never permission to downgrade/repost.
+      if (stored.intent.status === "SUBMISSION_ATTEMPTED" && state.lookup === "ABSENT") {
+        throw new Error("SUBMISSION_ATTEMPTED_RECOVERY_REQUIRED");
+      }
       await this.recordBrokerState(stored.intent, state, stored.dispatchBlockReason);
       // UNKNOWN + ABSENT remains UNKNOWN. It is intentionally never submitted here.
       if (state.status === "UNKNOWN") throw new Error("UNKNOWN_SUBMISSION_REQUIRES_RECOVERY");
