@@ -1,5 +1,6 @@
 import type { ClosedBar, ExecutionIntent, ExecutionStatus } from "./types.ts";
 import type { MarketSource } from "./market.ts";
+import { SPY_SPEC, alpacaEquityFeedFor } from "./assets.ts";
 
 export const ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 export const ALPACA_DATA_BASE_URL = "https://data.alpaca.markets";
@@ -27,9 +28,21 @@ export class AlpacaConfigurationError extends Error {
 }
 
 export class AlpacaTransportError extends Error {
-  readonly kind: "AUTHENTICATION_FAILURE" | "UNSUPPORTED_DATA_FEED" | "DISCONNECTED_STREAM" | "HTTP_FAILURE";
+  readonly kind:
+    | "AUTHENTICATION_FAILURE"
+    | "UNSUPPORTED_DATA_FEED"
+    | "DISCONNECTED_STREAM"
+    | "HTTP_FAILURE"
+    | "SUBSCRIPTION_FAILURE"
+    | "PROTOCOL_FAILURE";
   constructor(
-    kind: "AUTHENTICATION_FAILURE" | "UNSUPPORTED_DATA_FEED" | "DISCONNECTED_STREAM" | "HTTP_FAILURE",
+    kind:
+      | "AUTHENTICATION_FAILURE"
+      | "UNSUPPORTED_DATA_FEED"
+      | "DISCONNECTED_STREAM"
+      | "HTTP_FAILURE"
+      | "SUBSCRIPTION_FAILURE"
+      | "PROTOCOL_FAILURE",
     message: string,
   ) {
     super(message);
@@ -55,7 +68,7 @@ export function loadAlpacaConfig(env: NodeJS.ProcessEnv = process.env): AlpacaCo
   if (configuredDataUrl !== ALPACA_DATA_BASE_URL) {
     throw new AlpacaConfigurationError("INVALID_PAPER_DOMAIN", "ALPACA_DATA_BASE_URL is not supported.");
   }
-  const dataFeed = (env.ALPACA_DATA_FEED?.trim() || "iex").toLowerCase();
+  const dataFeed = (env.ALPACA_DATA_FEED?.trim() || alpacaEquityFeedFor(SPY_SPEC)).toLowerCase();
   if (dataFeed !== "iex" && dataFeed !== "sip" && dataFeed !== "delayed_sip") {
     throw new AlpacaConfigurationError("UNSUPPORTED_DATA_FEED", `Unsupported Alpaca feed: ${dataFeed}.`);
   }
@@ -65,7 +78,7 @@ export function loadAlpacaConfig(env: NodeJS.ProcessEnv = process.env): AlpacaCo
     paperBaseUrl: ALPACA_PAPER_BASE_URL,
     dataBaseUrl: ALPACA_DATA_BASE_URL,
     dataFeed,
-    symbol: env.ALPACA_SYMBOL?.trim().toUpperCase() || "SPY",
+    symbol: env.ALPACA_SYMBOL?.trim().toUpperCase() || SPY_SPEC.symbol,
   };
 }
 

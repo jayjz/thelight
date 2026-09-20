@@ -45,6 +45,9 @@ A decision produced after bar `t` closes must not receive economic exposure to t
 ## System model
 
 ```text
+AssetSpec
+    │
+    ▼
 MarketSource
     │
     ▼
@@ -108,6 +111,15 @@ generate strategy decisions,
 calculate Jev classifications,
 inspect future bars.
 
+The runtime selects data source, session eligibility, quantity semantics, and
+direction capability through an explicit `AssetSpec`. These capabilities do
+not contain strategy thresholds or risk parameters. The SPY PAPER worker remains
+the only wired runtime consumer (`US_EQUITY`, Alpaca IEX, US regular session,
+whole units, long/short). B2 also provides a separate, read-only
+`AlpacaCryptoMarketSource` for `BTC/USD` (`CRYPTO`, Alpaca crypto,
+always-open, fractional, long-only), but it is not attached to worker dispatch,
+evidence persistence, broker reconciliation, or execution.
+
 Planned interface:
 
 interface MarketSource {
@@ -123,6 +135,12 @@ HistoricalFileMarketSource
 Later:
 
 LiveMarketSource
+
+The crypto adapter accepts only Alpaca's completed `bars` channel (`T: "b"`),
+normalizes it into `ClosedBar` with the provider's minute-start timestamp, and
+excludes later updated-bar corrections (`T: "u"`) so already-consumed data is
+never revised. Its market-data WebSocket is provider-specific and separate from
+the IEX protocol parser; it has no broker or order capability.
 2. Feature engine
 
 Transforms market history available at time t into deterministic quantitative state.
