@@ -176,6 +176,8 @@ export type RiskEvaluation = {
   maxPosition: number;
   realizedVol: number;
   drawdown: number;
+  /** Broker-authoritative PAPER account high-water drawdown used by risk. */
+  equityDrawdown: number;
 };
 
 export type PolicyEvaluation = {

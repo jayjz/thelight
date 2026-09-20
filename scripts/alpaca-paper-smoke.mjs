@@ -27,8 +27,12 @@ if (!key || !secret) {
     console.log(JSON.stringify({ paper: true, account_status: body.status, trading_blocked: body.trading_blocked }, null, 2));
     const socket = new WebSocket(DATA_STREAM_URL);
     const closed = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Timed out waiting for FAKEPACA test bar.")), 15_000);
+      const timer = setTimeout(
+        () => reject(new Error("Timed out waiting for FAKEPACA test bar.")),
+        60_000,
+      );
       socket.addEventListener("message", (event) => {
+        console.log("WS:", event.data);
         const messages = JSON.parse(event.data);
         for (const message of messages) {
           if (message.T === "success" && message.msg === "connected") {

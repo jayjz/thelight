@@ -1,21 +1,25 @@
-import {
-  ALPACA_PAPER_BASE_URL,
-  AlpacaConfigurationError,
-  AlpacaTransportError,
-  alpacaHeaders,
-  loadAlpacaConfig,
-} from "./alpaca.server.ts";
+import { AlpacaConfigurationError } from "./alpaca.server.ts";
+import { readAlpacaPaperWorkerSnapshot, type AlpacaWorkerSnapshot } from "./alpaca-worker.server.ts";
 import type { TradingMode } from "./types.ts";
 
 export type LightlightRuntimeStatus = {
   mode: TradingMode;
   connectionState: "REPLAY" | "CONNECTED" | "MISSING_CREDENTIALS" | "AUTHENTICATION_FAILURE" | "UNSUPPORTED_DATA_FEED" | "DISCONNECTED_STREAM" | "ERROR";
+  workerState: "STOPPED" | "STARTING" | "RECONCILING" | "READY" | "HALTED" | null;
   symbol: string;
   feed: string;
+  decisionTimeframe: string;
+  latestRawBarTimestamp: number | null;
   latestClosedBarTimestamp: number | null;
   latestDecisionId: string | null;
   latestBrokerOrderState: string | null;
   currentPaperPosition: number | null;
+  openOrderSummary: { count: number; clientOrderIds: string[] };
+  riskState: string | null;
+  lastTradeUpdateTimestamp: string | null;
+  lastReconciliationTimestamp: string | null;
+  streamState: string;
+  haltReason: string | null;
   jevAdapter: string;
   jevModel: string;
   error: string | null;
@@ -26,28 +30,17 @@ export async function readLightlightRuntimeStatus(): Promise<LightlightRuntimeSt
   const mode: TradingMode = selected === "ALPACA_PAPER" ? "ALPACA_PAPER" : "PAPER_REPLAY";
   if (mode === "PAPER_REPLAY") {
     return {
-      mode, connectionState: "REPLAY", symbol: "SYN.LL1", feed: "synthetic-seeded",
+      mode, connectionState: "REPLAY", workerState: null, symbol: "SYN.LL1", feed: "synthetic-seeded", decisionTimeframe: "1D", latestRawBarTimestamp: null,
       latestClosedBarTimestamp: null, latestDecisionId: null, latestBrokerOrderState: null,
-      currentPaperPosition: 0, jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe", error: null,
+      currentPaperPosition: 0, openOrderSummary: { count: 0, clientOrderIds: [] }, riskState: null, lastTradeUpdateTimestamp: null,
+      lastReconciliationTimestamp: null, streamState: "REPLAY", haltReason: null, jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe", error: null,
     };
   }
   try {
-    const config = loadAlpacaConfig();
-    const response = await fetch(`${ALPACA_PAPER_BASE_URL}/v2/account`, {
-      headers: alpacaHeaders(config), signal: AbortSignal.timeout(8_000),
-    });
-    if (response.status === 401 || response.status === 403) {
-      return unavailable(mode, config.symbol, config.dataFeed, "AUTHENTICATION_FAILURE", "Alpaca PAPER authentication failed.");
-    }
-    if (!response.ok) {
-      return unavailable(mode, config.symbol, config.dataFeed, "ERROR", `Alpaca PAPER account check failed: ${response.status}.`);
-    }
-    return {
-      mode, connectionState: "DISCONNECTED_STREAM", symbol: config.symbol, feed: config.dataFeed,
-      latestClosedBarTimestamp: null, latestDecisionId: null, latestBrokerOrderState: null,
-      currentPaperPosition: null, jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe",
-      error: "PAPER account authenticated; market-data worker is not connected in this request.",
-    };
+    const snapshot = await readAlpacaPaperWorkerSnapshot();
+    return snapshot
+      ? fromWorker(snapshot)
+      : unavailable(mode, "SPY", "iex", "DISCONNECTED_STREAM", "PAPER worker has not been explicitly started by the server operator.");
   } catch (error) {
     if (error instanceof AlpacaConfigurationError) {
       return unavailable(
@@ -58,17 +51,21 @@ export async function readLightlightRuntimeStatus(): Promise<LightlightRuntimeSt
         error.message,
       );
     }
-    if (error instanceof AlpacaTransportError) {
-      return unavailable(
-        mode,
-        "SPY",
-        "iex",
-        error.kind === "HTTP_FAILURE" ? "ERROR" : error.kind,
-        error.message,
-      );
-    }
     return unavailable(mode, "SPY", "iex", "DISCONNECTED_STREAM", error instanceof Error ? error.message : "Alpaca connection failed.");
   }
+}
+
+function fromWorker(snapshot: AlpacaWorkerSnapshot): LightlightRuntimeStatus {
+  return {
+    mode: "ALPACA_PAPER", connectionState: snapshot.streamState === "CONNECTED" ? "CONNECTED" : "DISCONNECTED_STREAM",
+    workerState: snapshot.workerState, symbol: snapshot.symbol, feed: snapshot.feed, decisionTimeframe: snapshot.decisionTimeframe,
+    latestRawBarTimestamp: snapshot.latestRawBarTimestamp, latestClosedBarTimestamp: snapshot.latestClosedDecisionBarTimestamp,
+    latestDecisionId: snapshot.latestDecisionId, latestBrokerOrderState: snapshot.latestBrokerOrderState,
+    currentPaperPosition: snapshot.brokerPosition, openOrderSummary: snapshot.openOrderSummary, riskState: snapshot.riskState,
+    lastTradeUpdateTimestamp: snapshot.lastTradeUpdateTimestamp, lastReconciliationTimestamp: snapshot.lastReconciliationTimestamp,
+    streamState: snapshot.streamState, haltReason: snapshot.haltReason, jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe",
+    error: snapshot.haltReason,
+  };
 }
 
 function unavailable(
@@ -79,8 +76,9 @@ function unavailable(
   error: string,
 ): LightlightRuntimeStatus {
   return {
-    mode, connectionState, symbol, feed, latestClosedBarTimestamp: null,
+    mode, connectionState, workerState: "HALTED", symbol, feed, decisionTimeframe: "15Min", latestRawBarTimestamp: null, latestClosedBarTimestamp: null,
     latestDecisionId: null, latestBrokerOrderState: null, currentPaperPosition: null,
-    jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe", error,
+    openOrderSummary: { count: 0, clientOrderIds: [] }, riskState: null, lastTradeUpdateTimestamp: null, lastReconciliationTimestamp: null,
+    streamState: "DISCONNECTED", haltReason: error, jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe", error,
   };
 }

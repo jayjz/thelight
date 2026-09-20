@@ -275,6 +275,7 @@ export function evaluateRisk(input: {
     maxPosition: 1,
     realizedVol: features.realizedVol,
     drawdown: features.drawdown,
+    equityDrawdown,
   };
 }
 

@@ -1,0 +1,97 @@
+# Alpaca PAPER worker
+
+The worker is a server-side, single-symbol (`SPY`) owner for one PAPER session.
+It uses Alpaca closed 1Min bars, emits decisions only for fully populated,
+completed 15Min buckets, and uses the existing deterministic `ema_trend` / Arm
+`C` / risk path. React observes its snapshot and has no broker submission API.
+Server-only controls in `alpaca-worker-control.server.ts` provide `start`,
+`stop`, `status`, and `reconcile`; they are deliberately not UI routes.
+
+Run a session-owned worker process with:
+
+```sh
+npm run alpaca:worker -- start
+```
+
+It requires a durable `DATABASE_URL`; a process without it halts before it can
+connect streams or submit an order. Stop that session process with `SIGINT` or
+`SIGTERM`.
+
+## Authority and state
+
+```text
+STARTING -> RECONCILING -> READY
+                    \-> HALTED
+```
+
+Market and trade-update streams have independent state. The market stream uses
+`DISCONNECTED -> CONNECTING -> CONNECTED -> DEGRADED -> RECONCILING -> bounded
+reconnect -> CONNECTED`. Only one market consumer may be active. A transport
+failure reconciles durable intent/broker state before a replacement consumer is
+created; stop and HALTED cancel pending reconnects.
+
+At startup it reads the checkpoint before dispatch authority, reconciles the
+PAPER account, SPY position, open orders, all unresolved intents, and every
+UNKNOWN client order ID. An unrecognized open SPY order, unavailable position,
+or persisted UNKNOWN that remains absent halts dispatch. A later broker lookup
+that finds the order adopts it; absence never permits a second POST.
+
+Before every new intent dispatch, the worker again reads PAPER account equity,
+SPY position and open orders. Any open SPY order conservatively blocks the new
+target. Broker position is the sole sizing input. The worker uses
+`America/New_York`, weekdays, and bucket starts in `[09:30, 16:00)`: the 15:45
+bucket is eligible and the 16:00 bucket is not. This is deliberately not a full
+exchange calendar; market holidays and exceptional closures are not modeled in
+this pass. Market data outside that window is retained but cannot create a
+broker dispatch.
+
+PAPER equity drawdown uses broker-authoritative account equity. The durable
+high-water is `max(previousHighWater, currentEquity)` and the risk input is
+`(highWater - currentEquity) / highWater`. Invalid or unavailable equity halts
+the worker conservatively, and the value used is retained in decision evidence.
+An existing pre-hardening checkpoint that has no high-water value also halts for
+operator recovery rather than silently seeding a weaker peak from current equity.
+
+A missing or incomplete regular 15-minute bucket invalidates feature continuity.
+Returns, EMA, realized volatility, RSI and trend state restart from following
+complete buckets; dispatch remains blocked until feature warmup completes. This
+state is checkpointed, so a restart cannot bridge a gap.
+
+## Persistence
+
+`migrations/0002_alpaca_paper_worker.sql` stores append-only bars, immutable
+decision evidence, current intent projections, append-only broker order and
+position observations, trade updates, worker runs, and a checkpoint. The SQL
+backend configured with `DATABASE_URL` is required before dispatch authority is
+granted. The preview PGlite fallback is deliberately not used by this worker
+because it resets with the process.
+
+Decision evidence and its initial intent are inserted in one real database
+transaction (`BEGIN`, decision insert, intent insert, `COMMIT`; failure rolls
+back). A unique decision-to-intent constraint protects cardinality. Before a
+broker POST, intent state is durably marked `SUBMISSION_ATTEMPTED`; restart
+reconciles that deterministic client order identity and never treats it as new
+permission to submit again.
+
+## Manual smoke
+
+The default command authenticates, reconciles account/position/open orders, and
+observes a SPY bar. It never submits an order:
+
+```sh
+npm run alpaca:worker:smoke -- --observe-only
+```
+
+An actual PAPER dispatch is a separate, explicit operator action:
+
+```sh
+ALPACA_PAPER_WORKER_SMOKE_DISPATCH=YES npm run alpaca:worker:smoke -- --paper-dispatch
+```
+
+Neither command supports a live-money Alpaca domain.
+
+The dispatch smoke reads actual Alpaca 1-minute history into durable worker
+storage and invokes the worker path itself. It reports the deterministic
+decision/intent/client-order identities, reconciled position, persisted broker
+order state, and whether policy actually produced a dispatch. It never
+constructs a raw order POST.
