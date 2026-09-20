@@ -1,6 +1,7 @@
-/** Sprint 0 trading mode. There is no live-order path. */
+/** Runtime modes are deliberately paper-only; no live-money mode exists. */
+export const TRADING_MODES = ["PAPER_REPLAY", "ALPACA_PAPER"] as const;
 export const TRADING_MODE = "PAPER_REPLAY" as const;
-export type TradingMode = typeof TRADING_MODE;
+export type TradingMode = (typeof TRADING_MODES)[number];
 
 export const SYMBOL = "SYN.LL1";
 export const TIMEFRAME = "1D";
@@ -44,6 +45,9 @@ export type Candle = {
   close: number;
   volume: number;
 };
+
+/** A normalized bar that is known to be complete and safe for decisions. */
+export type ClosedBar = Candle;
 
 export type FeatureVector = {
   barIndex: number;
@@ -189,14 +193,77 @@ export type PolicyEvaluation = {
   reason: string;
 };
 
-export type PaperFill = {
+export type ExecutionStatus =
+  | "PENDING"
+  | "SUBMISSION_ATTEMPTED"
+  | "ACCEPTED"
+  | "REJECTED"
+  | "UNKNOWN"
+  | "PARTIALLY_FILLED"
+  | "FILLED"
+  | "CANCELLED";
+
+export type ExecutionIntent = {
+  intentId: string;
+  decisionId: string;
+  createdAtBar: number;
+  createdAtTimestamp: number;
+  desiredAction: Action;
+  desiredPosition: number;
+  status: ExecutionStatus;
+  executionModel: "NEXT_BAR_CLOSE" | "ALPACA_PAPER";
+  clientOrderId?: string;
+};
+
+export type Fill = {
+  fillId: string;
+  intentId: string;
+  decisionId: string;
+  fillBarIndex: number;
+  fillTimestamp: number;
+  fillPrice: number;
+  positionBefore: number;
+  positionAfter: number;
+  transactionCost: number;
+  slippage: number;
+  action: Action;
+  status: "FILLED" | "PARTIALLY_FILLED";
+  brokerOrderId?: string;
+};
+
+export type PositionTransition = {
+  transitionId: string;
+  intentId: string;
   decisionId: string;
   barIndex: number;
-  fillBarIndex: number;
-  action: Action;
+  timestamp: number;
+  positionBefore: number;
   positionAfter: number;
-  fillPrice: number;
-  note: string;
+  turnover: number;
+};
+
+export type EquityPoint = {
+  barIndex: number;
+  timestamp: number;
+  equity: number;
+  /** Net log return for the completed interval ending at this bar. */
+  periodReturn: number;
+  /** Position that existed during the completed interval. */
+  positionApplied: number;
+  transactionCost: number;
+  slippage: number;
+};
+
+export type ExecutionLedger = {
+  model: "NEXT_BAR_CLOSE" | "ALPACA_PAPER";
+  intents: ExecutionIntent[];
+  fills: Fill[];
+  transitions: PositionTransition[];
+  equity: EquityPoint[];
+  finalPosition: number;
+  finalEquity: number;
+  totalTransactionCost: number;
+  totalSlippage: number;
 };
 
 export type Evidence = {
@@ -218,7 +285,8 @@ export type Evidence = {
   policy: PolicyEvaluation;
   risk: RiskEvaluation;
   action: Action;
-  positionAfter: number;
+  /** Requested target only; an actual position changes only in the ledger. */
+  targetPosition: number;
   abstained: boolean;
 };
 
@@ -234,6 +302,8 @@ export type PathMetrics = {
   exposure: number;
   transactionCostBps: number;
   slippageBps: number;
+  transactionCosts: number;
+  slippageCosts: number;
   abstainedCount: number;
   note: string;
 };
@@ -244,7 +314,8 @@ export type JevEvalMetrics = {
   confidenceBuckets: { lo: number; hi: number; n: number; hit: number }[];
   selectiveAccuracy: { coverage: number; accuracy: number }[];
   decisionsAbstained: number;
-  byRegime: Record<string, { n: number; meanReturn: number }>;
+  /** Predictive outcome diagnostic, not a realized execution-performance measure. */
+  byPredictedRegime: Record<string, { n: number; meanNextBarMarketReturn: number }>;
   note: string;
 };
 
@@ -253,7 +324,9 @@ export type SessionResult = {
   strategyId: StrategyId;
   candles: Candle[];
   evidences: Evidence[];
-  fills: PaperFill[];
+  ledger: ExecutionLedger;
+  /** Presentation convenience; this is exactly ledger.fills, never a second ledger. */
+  fills: Fill[];
   metrics: PathMetrics;
   jevMetrics: JevEvalMetrics;
 };
