@@ -4,6 +4,7 @@ import {
   AlpacaHistoricalStockBars,
   AlpacaPaperBroker,
   AlpacaPaperTradeUpdates,
+  AlpacaTransportError,
   brokerStateFromTradeUpdate,
   loadAlpacaConfig,
   type AlpacaConfig,
@@ -548,14 +549,17 @@ export class AlpacaPaperWorker {
       await this.options.store.updateGapRecoveryAttempt(attempt);
       await this.persistCheckpoint();
     } catch (error) {
-      await this.enterRebuilding("BACKFILL_REQUEST_FAILED", { ...attempt, state: "REBUILDING", reason: error instanceof Error ? "BACKFILL_REQUEST_FAILED" : "BACKFILL_UNKNOWN_FAILURE" });
+      const reason = error instanceof AlpacaTransportError
+        ? error.kind
+        : "UNKNOWN_FAILURE";
+      await this.enterRebuilding("BACKFILL_REQUEST_FAILED", { ...attempt, state: "REBUILDING", reason });
     }
   }
 
   private async enterRebuilding(reason: string, attempt?: GapRecoveryAttempt): Promise<void> {
     this.checkpoint.recoveryState = "REBUILDING";
     this.checkpoint.featureContinuity = "REBUILDING";
-    if (attempt) await this.options.store.updateGapRecoveryAttempt({ ...attempt, state: "REBUILDING", result: attempt.result ?? reason, reason });
+    if (attempt) await this.options.store.updateGapRecoveryAttempt({ ...attempt, state: "REBUILDING", result: attempt.result ?? reason, reason: attempt.reason ?? reason });
     await this.persistCheckpoint();
   }
 

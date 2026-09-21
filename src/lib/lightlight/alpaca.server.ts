@@ -35,7 +35,8 @@ export class AlpacaTransportError extends Error {
     | "DISCONNECTED_STREAM"
     | "HTTP_FAILURE"
     | "SUBSCRIPTION_FAILURE"
-    | "PROTOCOL_FAILURE";
+    | "PROTOCOL_FAILURE"
+    | "TIMEOUT";
   constructor(
     kind:
       | "AUTHENTICATION_FAILURE"
@@ -43,7 +44,8 @@ export class AlpacaTransportError extends Error {
       | "DISCONNECTED_STREAM"
       | "HTTP_FAILURE"
       | "SUBSCRIPTION_FAILURE"
-      | "PROTOCOL_FAILURE",
+      | "PROTOCOL_FAILURE"
+      | "TIMEOUT",
     message: string,
   ) {
     super(message);
@@ -161,15 +163,33 @@ export class AlpacaHistoricalStockBars implements HistoricalStockBars {
     url.searchParams.set("end", new Date(end).toISOString());
     url.searchParams.set("limit", String(expected));
     url.searchParams.set("sort", "asc");
-    const response = await this.request(url, { headers: alpacaHeaders(this.config), signal: AbortSignal.timeout(25_000) });
+    let response: Response;
+    try {
+      response = await this.request(url, { headers: alpacaHeaders(this.config), signal: AbortSignal.timeout(25_000) });
+    } catch (error) {
+      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+        throw new AlpacaTransportError("TIMEOUT", "Alpaca historical bars request timed out.");
+      }
+      throw new AlpacaTransportError("HTTP_FAILURE", "Alpaca historical bars request failed.");
+    }
     if (response.status === 401 || response.status === 403) throw new AlpacaTransportError("AUTHENTICATION_FAILURE", "Alpaca historical market-data authentication failed.");
     if (!response.ok) throw new AlpacaTransportError("HTTP_FAILURE", `Alpaca historical bars request failed: ${response.status}.`);
-    const body = await response.json() as { bars?: Record<string, unknown[]>; next_page_token?: unknown };
-    const values = body.bars?.SPY;
-    if (!Array.isArray(values) || body.next_page_token) throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was incomplete.");
+    let body: { bars?: Record<string, unknown[]> };
+    try {
+      body = await response.json() as { bars?: Record<string, unknown[]> };
+    } catch {
+      throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was malformed.");
+    }
+    const values = body && typeof body === "object" && !Array.isArray(body) ? body.bars?.SPY : undefined;
+    if (!Array.isArray(values)) throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was malformed.");
     const bars = values.map((value) => strictHistoricalBar(value, start, end));
     const timestamps = new Set(bars.map((bar) => bar.t));
     if (timestamps.size !== bars.length) throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response contains duplicate timestamps.");
+    for (let timestamp = start; timestamp < end; timestamp += 60_000) {
+      if (!timestamps.has(timestamp)) {
+        throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was incomplete.");
+      }
+    }
     return bars.sort((left, right) => left.t - right.t);
   }
 }

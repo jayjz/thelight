@@ -145,14 +145,56 @@ describe("Alpaca paper boundaries", () => {
     assert.match(requested, /timeframe=1Min/); assert.match(requested, /feed=iex/); assert.match(requested, /symbols=SPY/);
   });
 
-  it("rejects malformed or duplicate historical bars rather than filling a gap", async () => {
+  it("accepts a complete bounded interval even when Alpaca returns a next-page token", async () => {
+    const historical = new AlpacaHistoricalStockBars(loadAlpacaConfig(env), async () => new Response(JSON.stringify({
+      bars: { SPY: [
+        { t: "2026-09-21T15:30:00Z", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 },
+        { t: "2026-09-21T15:31:00Z", o: 2, h: 3, l: 1.5, c: 2.5, v: 20 },
+      ] },
+      next_page_token: "continuation-is-irrelevant-after-completeness-check",
+    }), { status: 200 }));
+    const bars = await historical.bars({ symbol: "SPY", start: Date.parse("2026-09-21T15:30:00Z"), end: Date.parse("2026-09-21T15:32:00Z") });
+    assert.deepEqual(bars.map((bar) => bar.t), [Date.parse("2026-09-21T15:30:00Z"), Date.parse("2026-09-21T15:31:00Z")]);
+  });
+
+  it("rejects an incomplete bounded interval even when Alpaca returns a next-page token", async () => {
+    const historical = new AlpacaHistoricalStockBars(loadAlpacaConfig(env), async () => new Response(JSON.stringify({
+      bars: { SPY: [{ t: "2026-09-21T15:30:00Z", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 }] },
+      next_page_token: "more-results",
+    }), { status: 200 }));
+    await assert.rejects(
+      historical.bars({ symbol: "SPY", start: Date.parse("2026-09-21T15:30:00Z"), end: Date.parse("2026-09-21T15:32:00Z") }),
+      (error: unknown) => error instanceof AlpacaTransportError && error.kind === "PROTOCOL_FAILURE" && /incomplete/.test(error.message),
+    );
+  });
+
+  it("accepts an exact complete historical interval without a page token", async () => {
     const historical = new AlpacaHistoricalStockBars(loadAlpacaConfig(env), async () => new Response(JSON.stringify({ bars: { SPY: [
       { t: "2026-01-01T00:00:00Z", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 },
+      { t: "2026-01-01T00:01:00Z", o: 2, h: 3, l: 1.5, c: 2.5, v: 20 },
+    ] } }), { status: 200 }));
+    const bars = await historical.bars({ symbol: "SPY", start: Date.parse("2026-01-01T00:00:00Z"), end: Date.parse("2026-01-01T00:02:00Z") });
+    assert.equal(bars.length, 2);
+  });
+
+  it("rejects duplicate historical timestamps rather than filling a gap", async () => {
+    const historical = new AlpacaHistoricalStockBars(loadAlpacaConfig(env), async () => new Response(JSON.stringify({ bars: { SPY: [
       { t: "2026-01-01T00:00:00Z", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 },
+      { t: "2026-01-01T00:00:00Z", o: 2, h: 3, l: 1.5, c: 2.5, v: 20 },
     ] } }), { status: 200 }));
     await assert.rejects(
       historical.bars({ symbol: "SPY", start: Date.parse("2026-01-01T00:00:00Z"), end: Date.parse("2026-01-01T00:01:00Z") }),
-      /duplicate timestamps/,
+      (error: unknown) => error instanceof AlpacaTransportError && error.kind === "PROTOCOL_FAILURE" && /duplicate timestamps/.test(error.message),
+    );
+  });
+
+  it("rejects out-of-range historical timestamps", async () => {
+    const historical = new AlpacaHistoricalStockBars(loadAlpacaConfig(env), async () => new Response(JSON.stringify({ bars: { SPY: [
+      { t: "2026-01-01T00:01:00Z", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 },
+    ] } }), { status: 200 }));
+    await assert.rejects(
+      historical.bars({ symbol: "SPY", start: Date.parse("2026-01-01T00:00:00Z"), end: Date.parse("2026-01-01T00:01:00Z") }),
+      (error: unknown) => error instanceof AlpacaTransportError && error.kind === "PROTOCOL_FAILURE",
     );
   });
 

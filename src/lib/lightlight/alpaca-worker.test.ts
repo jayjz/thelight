@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { BrokerAccountSnapshot, BrokerOrderState, BrokerPositionSnapshot, HistoricalStockBars, OpenBrokerOrder } from "./alpaca.server.ts";
-import { ALPACA_PAPER_BASE_URL, type AlpacaConfig } from "./alpaca.server.ts";
+import { ALPACA_PAPER_BASE_URL, AlpacaTransportError, type AlpacaConfig } from "./alpaca.server.ts";
 import { ALPACA_WORKER_ASSET, AlpacaPaperWorker, MemoryAlpacaWorkerStore, alpacaPaperWorkerKey, deterministicClientOrderId, deterministicDecisionId, isRegularUsEquitySession } from "./alpaca-worker.server.ts";
 import type { MarketSource } from "./market.ts";
 import type { ExecutionIntent } from "./types.ts";
@@ -528,11 +528,14 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
 
     const unavailableStore = new MemoryAlpacaWorkerStore();
     await persistDurableBars(unavailableStore, bars.filter((bar) => bar.t !== first.t));
-    const unavailable = new FakeHistoricalBars(() => { throw new Error("HISTORICAL_UNAVAILABLE"); });
+    const unavailable = new FakeHistoricalBars(() => { throw new AlpacaTransportError("PROTOCOL_FAILURE", "safe test failure"); });
     const unavailableWorker = worker(unavailableStore, new FakeBroker(), undefined, true, unavailable, () => new Date(bars.at(-1)!.t + 2 * 60_000));
     await unavailableWorker.start();
     assert.equal(unavailableWorker.snapshot().recoveryState, "REBUILDING");
     assert.equal(unavailableWorker.snapshot().featureContinuity, "REBUILDING");
+    const failedAttempt = unavailableStore.recoveryAttempt(unavailableWorker.snapshot().recoveryAttemptId!);
+    assert.equal(failedAttempt?.result, "BACKFILL_REQUEST_FAILED");
+    assert.equal(failedAttempt?.reason, "PROTOCOL_FAILURE");
   });
 
   it("keeps dispatch blocked for partial multi-minute backfill and fails closed on conflicts", async () => {
