@@ -45,10 +45,14 @@ function intent(scope: string): ExecutionIntent {
   };
 }
 
-async function seedIntent(client: Client, value: ExecutionIntent): Promise<void> {
+function runtimeScope(workerKey: string, symbol = "SPY") {
+  return { workerKey, asset: { symbol } };
+}
+
+async function seedIntent(client: Client, value: ExecutionIntent, symbol = "SPY"): Promise<void> {
   await client.query(
-    "insert into decisions (decision_id, symbol, decision_timestamp_ms, evidence_json, created_at) values ($1, 'SPY', $2, '{}', now())",
-    [value.decisionId, value.createdAtTimestamp],
+    "insert into decisions (decision_id, symbol, decision_timestamp_ms, evidence_json, created_at) values ($1, $2, $3, '{}', now())",
+    [value.decisionId, symbol, value.createdAtTimestamp],
   );
   await client.query(
     "insert into execution_intents (intent_id, decision_id, client_order_id, status, intent_json, dispatch_block_reason, updated_at) values ($1, $2, $3, 'PENDING', $4, null, now())",
@@ -72,6 +76,8 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
     // Every identifier is under this test-only random prefix. Never truncate or
     // delete general worker evidence from the shared Neon database.
     await cleanup.query("delete from worker_leases where worker_key like $1", [`${scope}%`]);
+    await cleanup.query("delete from runtime_checkpoint where worker_key like $1", [`${scope}%`]);
+    await cleanup.query("delete from closed_bars where symbol like $1", [`${scope}%`]);
     await cleanup.query("delete from execution_intents where intent_id like $1", [`${scope}%`]);
     await cleanup.query("delete from decisions where decision_id like $1", [`${scope}%`]);
     await cleanup.query("delete from worker_runs where run_id like $1", [`${scope}%`]);
@@ -98,6 +104,92 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
     assert.equal((leaseA ?? leaseB)?.fencingToken, 1);
   });
 
+  it("gives SPY and BTC independent concurrent lease domains, with one owner per domain", async () => {
+    const spyKey = `${scope}:SPY:15Min`;
+    const btcKey = `${scope}:BTC/USD:15Min`;
+    const runs = {
+      spyA: `${scope}:multi:spy:a`, spyB: `${scope}:multi:spy:b`,
+      btcA: `${scope}:multi:btc:a`, btcB: `${scope}:multi:btc:b`,
+    };
+    await Promise.all([
+      storeA.createRun(runs.spyA, spyKey, "STARTING"), storeB.createRun(runs.spyB, spyKey, "STARTING"),
+      storeA.createRun(runs.btcA, btcKey, "STARTING"), storeB.createRun(runs.btcB, btcKey, "STARTING"),
+    ]);
+    const [spyA, spyB, btcA, btcB] = await Promise.all([
+      storeA.acquireOwnership(spyKey, runs.spyA, 30), storeB.acquireOwnership(spyKey, runs.spyB, 30),
+      storeA.acquireOwnership(btcKey, runs.btcA, 30), storeB.acquireOwnership(btcKey, runs.btcB, 30),
+    ]);
+    assert.equal([spyA, spyB].filter(Boolean).length, 1, "SPY has exactly one owner");
+    assert.equal([btcA, btcB].filter(Boolean).length, 1, "BTC has exactly one owner");
+    assert.equal((spyA ?? spyB)?.fencingToken, 1);
+    assert.equal((btcA ?? btcB)?.fencingToken, 1);
+  });
+
+  it("keeps same-timestamp closed bars and evidence symbols isolated", async () => {
+    const timestamp = 1_726_000_000_000;
+    const spySymbol = `${scope}:SPY`;
+    const btcSymbol = `${scope}:BTC/USD`;
+    const bar = { t: timestamp, open: 1, high: 2, low: 1, close: 2, volume: 3 };
+    assert.equal(await storeA.insertClosedBar(spySymbol, bar), true);
+    assert.equal(await storeB.insertClosedBar(btcSymbol, bar), true);
+    assert.deepEqual(await storeA.listClosedBars(spySymbol), [bar]);
+    assert.deepEqual(await storeB.listClosedBars(btcSymbol), [bar]);
+  });
+
+  it("rejects fencing tokens across SPY/BTC checkpoint domains", async () => {
+    const spyKey = `${scope}:checkpoint:SPY`;
+    const btcKey = `${scope}:checkpoint:BTC/USD`;
+    const spyRun = `${scope}:checkpoint:spy-run`;
+    const btcRun = `${scope}:checkpoint:btc-run`;
+    const spyIntent = intent(`${scope}:checkpoint:spy-intent`);
+    const btcIntent = intent(`${scope}:checkpoint:btc-intent`);
+    await Promise.all([storeA.createRun(spyRun, spyKey, "READY"), storeB.createRun(btcRun, btcKey, "READY")]);
+    await Promise.all([seedIntent(cleanup, spyIntent, "SPY"), seedIntent(cleanup, btcIntent, "BTC/USD")]);
+    const spyLease = await storeA.acquireOwnership(spyKey, spyRun, 30);
+    const btcLease = await storeB.acquireOwnership(btcKey, btcRun, 30);
+    assert.ok(spyLease); assert.ok(btcLease);
+    assert.equal(await storeA.writeCheckpointOwned(spyLease, { latestRawBarTimestamp: 11 } as never), true);
+    assert.equal(await storeB.writeCheckpointOwned(btcLease, { latestRawBarTimestamp: 22 } as never), true);
+    assert.equal(await storeB.writeCheckpointOwned({ ...btcLease, workerKey: spyKey }, { latestRawBarTimestamp: 999 } as never), false);
+    assert.equal(await storeA.writeCheckpointOwned({ ...spyLease, workerKey: btcKey }, { latestRawBarTimestamp: 999 } as never), false);
+    assert.equal(await storeB.claimIntentForDispatch(btcLease, spyIntent, runtimeScope(btcKey, "BTC/USD")), false, "BTC lease cannot claim SPY intent");
+    const spyIntents = await storeA.listIntents("SPY");
+    const btcIntents = await storeB.listIntents("BTC/USD");
+    assert.ok(spyIntents.some((stored) => stored.intent.intentId === spyIntent.intentId));
+    assert.equal(spyIntents.some((stored) => stored.intent.intentId === btcIntent.intentId), false, "SPY reconciliation cannot read BTC intent");
+    assert.ok(btcIntents.some((stored) => stored.intent.intentId === btcIntent.intentId));
+    assert.equal(btcIntents.some((stored) => stored.intent.intentId === spyIntent.intentId), false, "BTC reconciliation scope cannot read SPY intent");
+    assert.equal((await storeA.readCheckpoint(spyKey))?.latestRawBarTimestamp, 11);
+    assert.equal((await storeB.readCheckpoint(btcKey))?.latestRawBarTimestamp, 22);
+  });
+
+  it("increments fencing only within BTC and blocks its stale token from both domains", async () => {
+    const spyKey = `${scope}:takeover:SPY`;
+    const btcKey = `${scope}:takeover:BTC/USD`;
+    const spyRun = `${scope}:takeover:spy`;
+    const btcRunA = `${scope}:takeover:btc:a`;
+    const btcRunB = `${scope}:takeover:btc:b`;
+    await Promise.all([
+      storeA.createRun(spyRun, spyKey, "READY"),
+      storeA.createRun(btcRunA, btcKey, "READY"),
+      storeB.createRun(btcRunB, btcKey, "STARTING"),
+    ]);
+    const spyLease = await storeA.acquireOwnership(spyKey, spyRun, 30);
+    const btcLeaseA = await storeA.acquireOwnership(btcKey, btcRunA, 30);
+    assert.ok(spyLease); assert.ok(btcLeaseA);
+    assert.equal(await storeA.writeCheckpointOwned(spyLease, { latestRawBarTimestamp: 1 } as never), true);
+    assert.equal(await storeA.writeCheckpointOwned(btcLeaseA, { latestRawBarTimestamp: 2 } as never), true);
+    await cleanup.query("update worker_leases set lease_expires_at = now() - interval '1 second' where worker_key = $1", [btcKey]);
+    const btcLeaseB = await storeB.acquireOwnership(btcKey, btcRunB, 30);
+    assert.ok(btcLeaseB); assert.equal(btcLeaseB.fencingToken, btcLeaseA.fencingToken + 1);
+    const spyLeaseRow = await cleanup.query<{ fencing_token: number }>("select fencing_token from worker_leases where worker_key = $1", [spyKey]);
+    assert.equal(Number(spyLeaseRow.rows[0]?.fencing_token), spyLease.fencingToken, "BTC takeover cannot increment SPY generation");
+    assert.equal(await storeA.writeCheckpointOwned(btcLeaseA, { latestRawBarTimestamp: 3 } as never), false, "stale BTC token cannot write BTC");
+    assert.equal(await storeA.writeCheckpointOwned({ ...btcLeaseA, workerKey: spyKey }, { latestRawBarTimestamp: 4 } as never), false, "stale BTC token cannot write SPY");
+    assert.equal((await storeA.readCheckpoint(spyKey))?.latestRawBarTimestamp, 1);
+    assert.equal((await storeA.readCheckpoint(btcKey))?.latestRawBarTimestamp, 2);
+  });
+
   it("fences a stale owner and permits only the new owner to claim one intent", async () => {
     const key = `${scope}:fence`; const runA = `${scope}:fence:a`; const runB = `${scope}:fence:b`;
     const value = intent(`${scope}:fence`);
@@ -109,8 +201,8 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
     assert.ok(leaseB); assert.equal(leaseB.fencingToken, leaseA.fencingToken + 1);
 
     const [staleClaim, currentClaim] = await Promise.all([
-      storeA.claimIntentForDispatch(leaseA, value),
-      storeB.claimIntentForDispatch(leaseB, value),
+      storeA.claimIntentForDispatch(leaseA, value, runtimeScope(key)),
+      storeB.claimIntentForDispatch(leaseB, value, runtimeScope(key)),
     ]);
     assert.equal(staleClaim, false);
     assert.equal(currentClaim, true);
@@ -139,7 +231,7 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
     const leaseA = await storeA.acquireOwnership(key, runA, 30);
     assert.ok(leaseA);
     const unavailable = new SqlAlpacaWorkerStore(async () => { throw new Error("TEST_DB_UNAVAILABLE"); });
-    await assert.rejects(() => unavailable.claimIntentForDispatch(leaseA, value), /TEST_DB_UNAVAILABLE/);
+    await assert.rejects(() => unavailable.claimIntentForDispatch(leaseA, value, runtimeScope(key)), /TEST_DB_UNAVAILABLE/);
     const pending = await cleanup.query<{ status: string }>("select status from execution_intents where intent_id = $1", [value.intentId]);
     assert.equal(pending.rows[0]?.status, "PENDING");
 
@@ -160,9 +252,9 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
     assert.ok(leaseB);
     // The marker is legitimately owned by B; A's once-valid token cannot
     // enter the final guarded callback after takeover.
-    assert.equal(await storeB.claimIntentForDispatch(leaseB, value), true);
+    assert.equal(await storeB.claimIntentForDispatch(leaseB, value, runtimeScope(key)), true);
     let posted = false;
-    const result = await storeA.withDispatchAuthority(leaseA, value.intentId, async () => { posted = true; return "posted"; });
+    const result = await storeA.withDispatchAuthority(leaseA, value.intentId, runtimeScope(key), async () => { posted = true; return "posted"; });
     assert.equal(result, null); assert.equal(posted, false);
     assert.equal(await storeA.writeCheckpointOwned(leaseA, {} as never), false, "a stale callback cannot overwrite the current owner's checkpoint");
   });

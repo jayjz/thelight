@@ -151,3 +151,22 @@ and it imports no broker execution, order, database, or worker path.
 
 This implementation does not add BTC broker transport, fractional execution,
 durable BTC dispatch, a migration, or live-money behavior.
+
+B3 centralizes durable identity as `WorkerRuntimeIdentity`: it derives the
+legacy SPY key unchanged and a deterministic BTC/USD key from `AssetSpec`, the
+15-minute decision timeframe, the Alpaca PAPER provider context, and worker
+version. The capability is explicit rather than a scattered flag: SPY is
+`DISPATCH_CAPABLE`; BTC/USD is `READ_ONLY_DURABLE`. The latter can own a fenced
+Postgres lease, checkpoint, and closed-bar evidence/recovery namespace, but its
+runtime surface contains no broker order, cancellation, position mutation, or
+reconciliation operation.
+
+No migration is needed: `worker_key` already scopes runs, leases and
+checkpoints; `(symbol, timestamp_ms)` scopes closed bars; decisions and
+positions retain symbols; and global intent/order/update identifiers are made
+asset-safe by the asset-derived decision identity. Legacy SPY rows remain valid
+because both its worker key and deterministic decision hash input are unchanged.
+Independent-connection real-Postgres coverage proves simultaneous SPY/BTC
+leases, one owner per key, per-key fencing generations, stale-token rejection,
+and cross-asset checkpoint/bar isolation. BTC broker reconciliation and all
+BTC order submission remain deferred to B4.

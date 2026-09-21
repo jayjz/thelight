@@ -17,6 +17,15 @@ import { computeFeatures } from "./features.ts";
 import { buildJevRequest, createMockJevAdapter } from "./jev.ts";
 import type { MarketSource } from "./market.ts";
 import { SPY_SPEC, isMarketSessionOpen, type AssetSpec } from "./assets.ts";
+import {
+  ALPACA_PAPER_DECISION_TIMEFRAME,
+  ALPACA_PAPER_WORKER_VERSION,
+  SPY_RUNTIME_IDENTITY,
+  assertDispatchCapable,
+  workerRuntimeIdentityFor,
+  type DispatchCapableCapability,
+  type WorkerRuntimeIdentity,
+} from "./runtime-identity.ts";
 import { actionToPosition, classifyDeterministicRegime, evaluateAssetAwarePolicy, evaluateRisk, evaluateSignal } from "./policy.ts";
 import { STRATEGY_VERSION } from "./thresholds.ts";
 import type { ClosedBar, Evidence, ExecutionIntent, ExecutionStatus } from "./types.ts";
@@ -24,8 +33,8 @@ import type { ClosedBar, Evidence, ExecutionIntent, ExecutionStatus } from "./ty
 export const ALPACA_WORKER_ASSET = SPY_SPEC;
 /** @deprecated Use ALPACA_WORKER_ASSET.symbol for new callers. */
 export const ALPACA_WORKER_SYMBOL = ALPACA_WORKER_ASSET.symbol;
-export const ALPACA_WORKER_TIMEFRAME = "15Min";
-export const ALPACA_WORKER_CONFIG_VERSION = "alpaca-paper-worker-v1";
+export const ALPACA_WORKER_TIMEFRAME = ALPACA_PAPER_DECISION_TIMEFRAME;
+export const ALPACA_WORKER_CONFIG_VERSION = ALPACA_PAPER_WORKER_VERSION;
 const OWNERSHIP_LEASE_SECONDS = 30;
 const OWNERSHIP_RENEW_INTERVAL_MS = 10_000;
 
@@ -37,6 +46,8 @@ export type AlpacaWorkerSnapshot = {
   mode: "ALPACA_PAPER";
   workerState: WorkerState;
   symbol: string;
+  workerKey: string;
+  runtimeCapability: "DISPATCH_CAPABLE";
   feed: string;
   decisionTimeframe: "15Min";
   latestRawBarTimestamp: number | null;
@@ -113,11 +124,11 @@ export function isRegularUsEquitySession(timestamp: number): boolean {
 }
 
 export function alpacaPaperWorkerKey(asset: AssetSpec = ALPACA_WORKER_ASSET): string {
-  return `alpaca-paper:${asset.symbol}:${ALPACA_WORKER_TIMEFRAME}:${ALPACA_WORKER_CONFIG_VERSION}`;
+  return workerRuntimeIdentityFor(asset).workerKey;
 }
 
-export function deterministicDecisionId(timestamp: number): string {
-  const identity = [ALPACA_WORKER_ASSET.symbol, ALPACA_WORKER_TIMEFRAME, timestamp, "ema_trend", "C", ALPACA_WORKER_CONFIG_VERSION].join("|");
+export function deterministicDecisionId(timestamp: number, runtime: WorkerRuntimeIdentity = SPY_RUNTIME_IDENTITY): string {
+  const identity = [runtime.asset.symbol, runtime.decisionTimeframe, timestamp, "ema_trend", "C", runtime.workerVersion].join("|");
   return `LLP-${createHash("sha256").update(identity).digest("hex").slice(0, 32)}`;
 }
 
@@ -140,6 +151,7 @@ function newYorkDate(timestamp: number): string {
  */
 export class AlpacaPaperWorker {
   private readonly options: AlpacaPaperWorkerOptions;
+  private readonly runtimeIdentity: WorkerRuntimeIdentity & { capability: DispatchCapableCapability };
   private state: WorkerState = "STOPPED";
   private readonly key: string;
   private checkpoint = emptyCheckpoint();
@@ -171,12 +183,15 @@ export class AlpacaPaperWorker {
     this.options = options;
     if (options.config.paperBaseUrl !== "https://paper-api.alpaca.markets") throw new Error("LIVE_TRADING_FORBIDDEN");
     if (options.config.symbol !== ALPACA_WORKER_ASSET.symbol) throw new Error("ALPACA_WORKER_ONLY_SUPPORTS_SPY");
-    this.key = alpacaPaperWorkerKey(ALPACA_WORKER_ASSET);
+    const runtimeIdentity = workerRuntimeIdentityFor(ALPACA_WORKER_ASSET);
+    assertDispatchCapable(runtimeIdentity);
+    this.runtimeIdentity = runtimeIdentity;
+    this.key = this.runtimeIdentity.workerKey;
   }
 
   snapshot(): AlpacaWorkerSnapshot {
     return {
-      mode: "ALPACA_PAPER", workerState: this.state, symbol: this.options.config.symbol, feed: this.options.config.dataFeed,
+      mode: "ALPACA_PAPER", workerState: this.state, symbol: this.options.config.symbol, workerKey: this.key, runtimeCapability: this.runtimeIdentity.capability.kind, feed: this.options.config.dataFeed,
       decisionTimeframe: "15Min", latestRawBarTimestamp: this.checkpoint.latestRawBarTimestamp,
       latestClosedDecisionBarTimestamp: this.checkpoint.latestClosedDecisionBarTimestamp, latestDecisionId: this.checkpoint.latestDecisionId,
       strategy: "ema_trend", experimentArm: "C", riskState: this.riskState,
@@ -349,7 +364,7 @@ export class AlpacaPaperWorker {
     // contiguous run; no return, EMA, RSI, volatility, or trend bridges a gap.
     for (let index = 0; index < trailingContinuous.length; index += 1) {
       const decisionBar = trailingContinuous[index]!;
-      const decisionId = deterministicDecisionId(decisionBar.t);
+      const decisionId = deterministicDecisionId(decisionBar.t, this.runtimeIdentity);
       const evidence = await this.decisionEvidence(trailingContinuous, index, decisionId);
       const inSession = (this.options.isRegularSession ?? ((timestamp) => isMarketSessionOpen(ALPACA_WORKER_ASSET, timestamp)))(decisionBar.t);
       const dispatchEligible = inSession && evidence.features.warmupComplete;
@@ -420,7 +435,7 @@ export class AlpacaPaperWorker {
     if (!ownership) throw new Error("DISPATCH_OWNERSHIP_REQUIRED");
     // This durable marker closes the crash window after a broker POST begins.
     // It is also a conditional, fenced claim: an old owner cannot change it.
-    if (!await this.options.store.claimIntentForDispatch(ownership, intent)) {
+    if (!await this.options.store.claimIntentForDispatch(ownership, intent, this.runtimeIdentity)) {
       await this.loseOwnership("DISPATCH_OWNERSHIP_LOST");
       throw new Error("DISPATCH_OWNERSHIP_LOST");
     }
@@ -430,6 +445,7 @@ export class AlpacaPaperWorker {
     const submitted = await this.options.store.withDispatchAuthority(
       ownership,
       intent.intentId,
+      this.runtimeIdentity,
       // The durable store owns the submission marker. The broker adapter needs
       // its pre-POST reconciliation view to remain PENDING so it can perform
       // the one authorized POST rather than treating the marker as a retry.
@@ -451,7 +467,7 @@ export class AlpacaPaperWorker {
     this.brokerPosition = position;
     await this.options.store.appendBrokerPosition(position);
     this.openOrders = await this.options.broker.openOrders();
-    const intents = await this.options.store.listIntents();
+    const intents = await this.options.store.listIntents(ALPACA_WORKER_ASSET.symbol);
     const knownClientIds = new Set(intents.map(({ intent }) => intent.clientOrderId ?? intent.intentId));
     const unknownOpenOrder = this.openOrders.find((order) => !knownClientIds.has(order.clientOrderId));
     if (unknownOpenOrder) throw new Error(`CONTRADICTORY_OPEN_BROKER_ORDER:${unknownOpenOrder.clientOrderId || "MISSING_CLIENT_ORDER_ID"}`);
@@ -518,7 +534,7 @@ export class AlpacaPaperWorker {
     await this.options.store.appendTradeUpdate(update, clientOrderId);
     this.lastTradeUpdateTimestamp = (this.options.now ?? (() => new Date()))().toISOString();
     if (!clientOrderId) return this.persistCheckpoint();
-    const stored = (await this.options.store.listIntents()).find(({ intent }) => (intent.clientOrderId ?? intent.intentId) === clientOrderId);
+    const stored = (await this.options.store.listIntents(ALPACA_WORKER_ASSET.symbol)).find(({ intent }) => (intent.clientOrderId ?? intent.intentId) === clientOrderId);
     if (stored) {
       const state = brokerStateFromTradeUpdate(update, stored.intent);
       if (state) await this.recordBrokerState(stored.intent, state, stored.dispatchBlockReason);

@@ -86,7 +86,7 @@ async function dispatchThroughWorker(headers) {
     isRegularSession: (timestamp) => timestamp === targetTimestamp,
   });
   await worker.start();
-  const intent = (await store.listIntents()).find((row) => row.intent.createdAtTimestamp === targetTimestamp) ?? null;
+  const intent = (await store.listIntents(symbol)).find((row) => row.intent.createdAtTimestamp === targetTimestamp) ?? null;
   const brokerOrder = intent ? await store.latestBrokerOrder(intent.intent.intentId) : null;
   const snapshot = worker.snapshot();
   console.log(JSON.stringify({

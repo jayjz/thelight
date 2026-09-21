@@ -16,7 +16,7 @@ Target progression:
 1. Freeze current SPY behavior. **Complete (B0)**
 2. Introduce an explicit asset/runtime contract. **Complete (B1)**
 3. Add Alpaca crypto market-data transport. **Complete (B2)**
-4. Scope worker identity, leases, checkpoints, evidence, and broker state by asset.
+4. Scope worker identity, leases, checkpoints, evidence, and broker state by asset. **Complete (B3)**
 5. Add `BTC/USD` long-only fractional PAPER execution.
 6. Add BTC-specific deterministic risk and cost configuration.
 7. Exercise the complete BTC PAPER path.
@@ -118,6 +118,57 @@ B2 does not prove:
 - durable BTC dispatch; or
 - BTC restart/reconciliation.
 
+## B3 implementation status
+
+B3 centralizes a pure `WorkerRuntimeIdentity` derived from `AssetSpec`. It
+preserves SPY's legacy identity exactly:
+
+```text
+alpaca-paper:SPY:15Min:alpaca-paper-worker-v1
+```
+
+and gives BTC/USD its independent identity:
+
+```text
+alpaca-paper:BTC/USD:15Min:alpaca-paper-worker-v1
+```
+
+The identity has an explicit capability discriminant. SPY is
+`DISPATCH_CAPABLE` at the existing equity broker boundary. BTC/USD is
+`READ_ONLY_DURABLE` (`MARKET_EVIDENCE_ONLY`): it can acquire its own fenced
+lease, restore/write its own checkpoint, and persist/recover normalized closed
+bars, but its runtime type receives neither broker reconciliation nor dispatch
+operations.
+
+No schema migration is required. Existing tables already isolate worker runs,
+leases, and checkpoints by `worker_key`, raw bars by `(symbol, timestamp_ms)`,
+decisions and positions by `symbol`, and downstream intent/order/update records
+by global deterministic IDs. Decision, intent, and client-order IDs now derive
+from the asset identity, so same-timestamp SPY and BTC records cannot collide.
+Legacy SPY rows remain valid because its worker key and deterministic decision
+hash input are byte-for-byte unchanged.
+
+Real Postgres tests use independent connections and random test-only keys to
+prove one-owner-per-asset, simultaneous SPY/BTC leases, per-key fencing
+generations, stale-token rejection, cross-asset checkpoint rejection, and
+same-timestamp bar isolation. They do not call Alpaca.
+
+B3 proves:
+
+- deterministic BTC runtime identity;
+- independent worker/lease namespace;
+- independent checkpoint and closed-bar evidence namespace;
+- real Postgres fencing isolation; and
+- a safe durable-versus-dispatch capability boundary.
+
+B3 does not prove:
+
+- BTC order submission;
+- fractional execution;
+- BTC broker reconciliation or position mutation;
+- BTC profitability or strategy calibration; or
+- live-money trading.
+
 Non-negotiable invariants
 no component may use information unavailable at the decision timestamp
 decisions use only completed bars
@@ -190,7 +241,7 @@ Infrastructure validation and strategy validation are separate milestones.
 
 BTC runtime acceptance criteria
 
-Before this branch is considered complete:
+Before B8 is considered complete:
 
 existing SPY tests and semantics remain unchanged
 BTC/USD market data normalizes into completed bars

@@ -114,11 +114,15 @@ inspect future bars.
 The runtime selects data source, session eligibility, quantity semantics, and
 direction capability through an explicit `AssetSpec`. These capabilities do
 not contain strategy thresholds or risk parameters. The SPY PAPER worker remains
-the only wired runtime consumer (`US_EQUITY`, Alpaca IEX, US regular session,
-whole units, long/short). B2 also provides a separate, read-only
-`AlpacaCryptoMarketSource` for `BTC/USD` (`CRYPTO`, Alpaca crypto,
-always-open, fractional, long-only), but it is not attached to worker dispatch,
-evidence persistence, broker reconciliation, or execution.
+the only dispatch-capable runtime consumer (`US_EQUITY`, Alpaca IEX, US regular
+session, whole units, long/short). B2 also provides a separate, read-only
+`AlpacaCryptoMarketSource` for `BTC/USD` (`CRYPTO`, Alpaca crypto, always-open,
+fractional, long-only). B3 gives both assets a deterministic
+`WorkerRuntimeIdentity`: worker run/lease/fencing and checkpoint state use its
+`workerKey`; raw closed-bar evidence uses its asset symbol. BTC's runtime is
+`READ_ONLY_DURABLE`, so it may recover bars and its checkpoint under a fenced
+lease but has no broker-reconciliation or dispatch capability. SPY alone is
+`DISPATCH_CAPABLE` at the equity broker boundary.
 
 Planned interface:
 

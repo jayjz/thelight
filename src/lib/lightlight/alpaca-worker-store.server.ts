@@ -30,6 +30,12 @@ export type WorkerLease = {
   leaseExpiresAt: string;
 };
 
+/** Minimal durable scope required to bind an intent operation to its runtime. */
+export type DurableWorkerScope = {
+  workerKey: string;
+  asset: { symbol: string };
+};
+
 export interface AlpacaWorkerStore {
   /** True only when state survives a process recreation. */
   readonly durable: boolean;
@@ -42,18 +48,18 @@ export interface AlpacaWorkerStore {
   /** Makes this exact lease immediately replaceable; recovery never depends on it. */
   releaseOwnership(lease: WorkerLease): Promise<void>;
   /** Marks PENDING -> SUBMISSION_ATTEMPTED only for the current fenced owner. */
-  claimIntentForDispatch(lease: WorkerLease, intent: ExecutionIntent): Promise<boolean>;
+  claimIntentForDispatch(lease: WorkerLease, intent: ExecutionIntent, scope: DurableWorkerScope): Promise<boolean>;
   /**
    * Revalidates and renews the fenced lease under a row lock immediately before
    * the external POST. The lock serializes lease takeover with the bounded POST.
    */
-  withDispatchAuthority<T>(lease: WorkerLease, intentId: string, submit: () => Promise<T>): Promise<T | null>;
+  withDispatchAuthority<T>(lease: WorkerLease, intentId: string, scope: DurableWorkerScope, submit: () => Promise<T>): Promise<T | null>;
   insertClosedBar(symbol: string, bar: ClosedBar): Promise<boolean>;
   listClosedBars(symbol: string): Promise<ClosedBar[]>;
   /** Atomically creates immutable evidence and its initial durable intent. */
   persistDecisionAndIntent(evidence: Evidence, intent: ExecutionIntent, dispatchBlockReason?: string | null): Promise<{ inserted: boolean }>;
   putIntent(intent: ExecutionIntent, dispatchBlockReason?: string | null): Promise<void>;
-  listIntents(): Promise<StoredIntent[]>;
+  listIntents(symbol?: string): Promise<StoredIntent[]>;
   appendBrokerOrder(state: BrokerOrderState): Promise<void>;
   latestBrokerOrder(intentId: string): Promise<BrokerOrderState | null>;
   appendBrokerPosition(position: BrokerPositionSnapshot): Promise<void>;
@@ -141,17 +147,19 @@ export class SqlAlpacaWorkerStore implements AlpacaWorkerStore {
     );
   }
 
-  async claimIntentForDispatch(lease: WorkerLease, intent: ExecutionIntent): Promise<boolean> {
+  async claimIntentForDispatch(lease: WorkerLease, intent: ExecutionIntent, scope: DurableWorkerScope): Promise<boolean> {
+    if (lease.workerKey !== scope.workerKey) return false;
     const sql = await this.sqlProvider();
     const claimed = { ...intent, status: "SUBMISSION_ATTEMPTED" as const };
     const rows = await sql.query<{ intent_id: string }>(
-      "update execution_intents set status = 'SUBMISSION_ATTEMPTED', intent_json = $5, dispatch_block_reason = null, updated_at = now() where intent_id = $1 and status = 'PENDING' and exists (select 1 from worker_leases where worker_key = $2 and owner_run_id = $3 and fencing_token = $4 and lease_expires_at > clock_timestamp()) returning intent_id",
-      [intent.intentId, lease.workerKey, lease.runId, lease.fencingToken, JSON.stringify(claimed)],
+      "update execution_intents set status = 'SUBMISSION_ATTEMPTED', intent_json = $6, dispatch_block_reason = null, updated_at = now() where intent_id = $1 and status = 'PENDING' and exists (select 1 from worker_leases where worker_key = $2 and owner_run_id = $3 and fencing_token = $4 and lease_expires_at > clock_timestamp()) and exists (select 1 from decisions where decision_id = execution_intents.decision_id and symbol = $5) returning intent_id",
+      [intent.intentId, lease.workerKey, lease.runId, lease.fencingToken, scope.asset.symbol, JSON.stringify(claimed)],
     );
     return rows.length === 1;
   }
 
-  async withDispatchAuthority<T>(lease: WorkerLease, intentId: string, submit: () => Promise<T>): Promise<T | null> {
+  async withDispatchAuthority<T>(lease: WorkerLease, intentId: string, scope: DurableWorkerScope, submit: () => Promise<T>): Promise<T | null> {
+    if (lease.workerKey !== scope.workerKey) return null;
     const sql = await this.sqlProvider();
     return sql.transaction(async (tx) => {
       const held = await tx.query<{ worker_key: string }>(
@@ -160,8 +168,8 @@ export class SqlAlpacaWorkerStore implements AlpacaWorkerStore {
       );
       if (!held[0]) return null;
       const claimed = await tx.query<{ intent_id: string }>(
-        "select intent_id from execution_intents where intent_id = $1 and status = 'SUBMISSION_ATTEMPTED' for update",
-        [intentId],
+        "select execution_intents.intent_id from execution_intents join decisions on decisions.decision_id = execution_intents.decision_id where execution_intents.intent_id = $1 and execution_intents.status = 'SUBMISSION_ATTEMPTED' and decisions.symbol = $2 for update",
+        [intentId, scope.asset.symbol],
       );
       if (!claimed[0]) return null;
       await tx.query(
@@ -217,9 +225,9 @@ export class SqlAlpacaWorkerStore implements AlpacaWorkerStore {
     );
   }
 
-  async listIntents(): Promise<StoredIntent[]> {
+  async listIntents(symbol?: string): Promise<StoredIntent[]> {
     const sql = await this.sqlProvider();
-    const rows = await sql.query<{ intent_json: string; dispatch_block_reason: string | null }>("select intent_json, dispatch_block_reason from execution_intents order by updated_at asc");
+    const rows = await sql.query<{ intent_json: string; dispatch_block_reason: string | null }>("select execution_intents.intent_json, execution_intents.dispatch_block_reason from execution_intents join decisions on decisions.decision_id = execution_intents.decision_id where ($1::text is null or decisions.symbol = $1) order by execution_intents.updated_at asc", [symbol ?? null]);
     return rows.map((row) => ({ intent: JSON.parse(row.intent_json) as ExecutionIntent, dispatchBlockReason: row.dispatch_block_reason }));
   }
 
@@ -308,17 +316,18 @@ export class MemoryAlpacaWorkerStore implements AlpacaWorkerStore {
     const current = this.leases.get(lease.workerKey);
     if (current && current.runId === lease.runId && current.fencingToken === lease.fencingToken) current.leaseExpiresAt = new Date(0).toISOString();
   }
-  async claimIntentForDispatch(lease: WorkerLease, intent: ExecutionIntent): Promise<boolean> {
+  async claimIntentForDispatch(lease: WorkerLease, intent: ExecutionIntent, scope: DurableWorkerScope): Promise<boolean> {
     const current = await this.renewOwnership(lease, 30);
     const stored = this.intents.get(intent.intentId);
-    if (!current || !stored || stored.intent.status !== "PENDING") return false;
+    if (lease.workerKey !== scope.workerKey || !current || !stored || stored.intent.status !== "PENDING" || this.decisions.get(stored.intent.decisionId)?.symbol !== scope.asset.symbol) return false;
     stored.intent = { ...clone(intent), status: "SUBMISSION_ATTEMPTED" };
     stored.dispatchBlockReason = null;
     return true;
   }
-  async withDispatchAuthority<T>(lease: WorkerLease, intentId: string, submit: () => Promise<T>): Promise<T | null> {
+  async withDispatchAuthority<T>(lease: WorkerLease, intentId: string, scope: DurableWorkerScope, submit: () => Promise<T>): Promise<T | null> {
     const current = await this.renewOwnership(lease, 30);
-    if (!current || this.intents.get(intentId)?.intent.status !== "SUBMISSION_ATTEMPTED") return null;
+    const stored = this.intents.get(intentId);
+    if (lease.workerKey !== scope.workerKey || !current || stored?.intent.status !== "SUBMISSION_ATTEMPTED" || this.decisions.get(stored.intent.decisionId)?.symbol !== scope.asset.symbol) return null;
     return submit();
   }
   async insertClosedBar(symbol: string, bar: ClosedBar): Promise<boolean> {
@@ -347,7 +356,11 @@ export class MemoryAlpacaWorkerStore implements AlpacaWorkerStore {
     return { inserted: true };
   }
   async putIntent(intent: ExecutionIntent, dispatchBlockReason: string | null = null): Promise<void> { this.intents.set(intent.intentId, { intent: clone(intent), dispatchBlockReason }); }
-  async listIntents(): Promise<StoredIntent[]> { return [...this.intents.values()].map(clone); }
+  async listIntents(symbol?: string): Promise<StoredIntent[]> {
+    return [...this.intents.values()]
+      .filter((stored) => !symbol || this.decisions.get(stored.intent.decisionId)?.symbol === symbol)
+      .map(clone);
+  }
   async appendBrokerOrder(state: BrokerOrderState): Promise<void> { this.posts.push(clone(state)); }
   async latestBrokerOrder(intentId: string): Promise<BrokerOrderState | null> {
     return clone([...this.posts].reverse().find((state) => state.intentId === intentId) ?? null);

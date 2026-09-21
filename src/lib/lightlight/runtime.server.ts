@@ -1,6 +1,7 @@
 import { AlpacaConfigurationError } from "./alpaca.server.ts";
 import { readAlpacaPaperWorkerSnapshot, type AlpacaWorkerSnapshot } from "./alpaca-worker.server.ts";
 import { SPY_SPEC, alpacaEquityFeedFor } from "./assets.ts";
+import { SPY_RUNTIME_IDENTITY, type WorkerRuntimeCapability } from "./runtime-identity.ts";
 import type { TradingMode } from "./types.ts";
 
 export type LightlightRuntimeStatus = {
@@ -8,6 +9,8 @@ export type LightlightRuntimeStatus = {
   connectionState: "REPLAY" | "CONNECTED" | "MISSING_CREDENTIALS" | "AUTHENTICATION_FAILURE" | "UNSUPPORTED_DATA_FEED" | "DISCONNECTED_STREAM" | "ERROR";
   workerState: "STOPPED" | "STARTING" | "RECONCILING" | "READY" | "HALTED" | null;
   symbol: string;
+  workerKey: string | null;
+  runtimeCapability: WorkerRuntimeCapability["kind"] | null;
   feed: string;
   decisionTimeframe: string;
   latestRawBarTimestamp: number | null;
@@ -31,7 +34,7 @@ export async function readLightlightRuntimeStatus(): Promise<LightlightRuntimeSt
   const mode: TradingMode = selected === "ALPACA_PAPER" ? "ALPACA_PAPER" : "PAPER_REPLAY";
   if (mode === "PAPER_REPLAY") {
     return {
-      mode, connectionState: "REPLAY", workerState: null, symbol: "SYN.LL1", feed: "synthetic-seeded", decisionTimeframe: "1D", latestRawBarTimestamp: null,
+      mode, connectionState: "REPLAY", workerState: null, symbol: "SYN.LL1", workerKey: null, runtimeCapability: null, feed: "synthetic-seeded", decisionTimeframe: "1D", latestRawBarTimestamp: null,
       latestClosedBarTimestamp: null, latestDecisionId: null, latestBrokerOrderState: null,
       currentPaperPosition: 0, openOrderSummary: { count: 0, clientOrderIds: [] }, riskState: null, lastTradeUpdateTimestamp: null,
       lastReconciliationTimestamp: null, streamState: "REPLAY", haltReason: null, jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe", error: null,
@@ -59,7 +62,7 @@ export async function readLightlightRuntimeStatus(): Promise<LightlightRuntimeSt
 function fromWorker(snapshot: AlpacaWorkerSnapshot): LightlightRuntimeStatus {
   return {
     mode: "ALPACA_PAPER", connectionState: snapshot.streamState === "CONNECTED" ? "CONNECTED" : "DISCONNECTED_STREAM",
-    workerState: snapshot.workerState, symbol: snapshot.symbol, feed: snapshot.feed, decisionTimeframe: snapshot.decisionTimeframe,
+    workerState: snapshot.workerState, symbol: snapshot.symbol, workerKey: snapshot.workerKey, runtimeCapability: snapshot.runtimeCapability, feed: snapshot.feed, decisionTimeframe: snapshot.decisionTimeframe,
     latestRawBarTimestamp: snapshot.latestRawBarTimestamp, latestClosedBarTimestamp: snapshot.latestClosedDecisionBarTimestamp,
     latestDecisionId: snapshot.latestDecisionId, latestBrokerOrderState: snapshot.latestBrokerOrderState,
     currentPaperPosition: snapshot.brokerPosition, openOrderSummary: snapshot.openOrderSummary, riskState: snapshot.riskState,
@@ -77,7 +80,7 @@ function unavailable(
   error: string,
 ): LightlightRuntimeStatus {
   return {
-    mode, connectionState, workerState: "HALTED", symbol, feed, decisionTimeframe: "15Min", latestRawBarTimestamp: null, latestClosedBarTimestamp: null,
+    mode, connectionState, workerState: "HALTED", symbol, workerKey: SPY_RUNTIME_IDENTITY.workerKey, runtimeCapability: SPY_RUNTIME_IDENTITY.capability.kind, feed, decisionTimeframe: "15Min", latestRawBarTimestamp: null, latestClosedBarTimestamp: null,
     latestDecisionId: null, latestBrokerOrderState: null, currentPaperPosition: null,
     openOrderSummary: { count: 0, clientOrderIds: [] }, riskState: null, lastTradeUpdateTimestamp: null, lastReconciliationTimestamp: null,
     streamState: "DISCONNECTED", haltReason: error, jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe", error,

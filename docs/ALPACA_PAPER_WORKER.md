@@ -43,6 +43,14 @@ graceful/operator and fail-closed meanings. Graceful shutdown terminalizes its
 run and makes its exact lease immediately replaceable; expiry remains the
 recovery path if it crashes.
 
+The worker key is a pure `AssetSpec` runtime identity:
+`alpaca-paper:<symbol>:15Min:alpaca-paper-worker-v1`. The existing SPY value is
+unchanged. B3 also establishes `BTC/USD`'s distinct key and fenced durable
+market/checkpoint namespace. This does not grant BTC dispatch: its
+`READ_ONLY_DURABLE` runtime has no broker reconciliation, trade-update, intent
+claim, or broker POST capability. The SPY worker remains the only
+`DISPATCH_CAPABLE` implementation described by this document.
+
 ```text
 STARTING -> RECONCILING -> READY
                     \-> HALTED
