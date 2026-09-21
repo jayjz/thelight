@@ -117,6 +117,63 @@ export type AlpacaStockBarMessage = {
   t: string;
 };
 
+/** Read-only, bounded historical market-data boundary. It has no broker API. */
+export interface HistoricalStockBars {
+  bars(request: { symbol: "SPY"; start: number; end: number }): Promise<ClosedBar[]>;
+}
+
+function strictHistoricalBar(value: unknown, start: number, end: number): ClosedBar {
+  const bar = value as Record<string, unknown>;
+  const timestamp = typeof bar.t === "string" ? Date.parse(bar.t) : Number.NaN;
+  const open = Number(bar.o); const high = Number(bar.h); const low = Number(bar.l); const close = Number(bar.c); const volume = Number(bar.v);
+  if (!Number.isFinite(timestamp) || timestamp % 60_000 !== 0 || timestamp < start || timestamp >= end ||
+    ![open, high, low, close, volume].every(Number.isFinite) || volume < 0 || low > Math.min(open, close) || high < Math.max(open, close) || high < low) {
+    throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars failed strict validation.");
+  }
+  return { t: timestamp, open, high, low, close, volume };
+}
+
+/**
+ * Deliberately separate from AlpacaPaperBroker: this client can only retrieve
+ * fixed SPY/IEX 1-minute bars for a caller-provided bounded interval.
+ */
+export class AlpacaHistoricalStockBars implements HistoricalStockBars {
+  private readonly config: AlpacaConfig;
+  private readonly request: typeof fetch;
+
+  constructor(config: AlpacaConfig, request: typeof fetch = fetch) {
+    this.config = config;
+    this.request = request;
+    if (config.dataBaseUrl !== ALPACA_DATA_BASE_URL || config.symbol !== "SPY") throw new Error("ALPACA_HISTORICAL_SCOPE_FORBIDDEN");
+  }
+
+  async bars({ symbol, start, end }: { symbol: "SPY"; start: number; end: number }): Promise<ClosedBar[]> {
+    if (symbol !== "SPY" || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= end || start % 60_000 !== 0 || end % 60_000 !== 0) {
+      throw new Error("INVALID_HISTORICAL_BAR_RANGE");
+    }
+    const expected = (end - start) / 60_000;
+    if (expected > 390) throw new Error("HISTORICAL_BAR_RANGE_UNBOUNDED");
+    const url = new URL("/v2/stocks/bars", ALPACA_DATA_BASE_URL);
+    url.searchParams.set("symbols", "SPY");
+    url.searchParams.set("timeframe", "1Min");
+    url.searchParams.set("feed", "iex");
+    url.searchParams.set("start", new Date(start).toISOString());
+    url.searchParams.set("end", new Date(end).toISOString());
+    url.searchParams.set("limit", String(expected));
+    url.searchParams.set("sort", "asc");
+    const response = await this.request(url, { headers: alpacaHeaders(this.config), signal: AbortSignal.timeout(25_000) });
+    if (response.status === 401 || response.status === 403) throw new AlpacaTransportError("AUTHENTICATION_FAILURE", "Alpaca historical market-data authentication failed.");
+    if (!response.ok) throw new AlpacaTransportError("HTTP_FAILURE", `Alpaca historical bars request failed: ${response.status}.`);
+    const body = await response.json() as { bars?: Record<string, unknown[]>; next_page_token?: unknown };
+    const values = body.bars?.SPY;
+    if (!Array.isArray(values) || body.next_page_token) throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was incomplete.");
+    const bars = values.map((value) => strictHistoricalBar(value, start, end));
+    const timestamps = new Set(bars.map((bar) => bar.t));
+    if (timestamps.size !== bars.length) throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response contains duplicate timestamps.");
+    return bars.sort((left, right) => left.t - right.t);
+  }
+}
+
 /** A 1Min bar may enter only after its own minute has elapsed. */
 export function closedBarFromAlpaca(
   message: AlpacaStockBarMessage,

@@ -1,18 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   AlpacaMarketSource,
+  AlpacaHistoricalStockBars,
   AlpacaPaperBroker,
   AlpacaPaperTradeUpdates,
   brokerStateFromTradeUpdate,
   loadAlpacaConfig,
   type AlpacaConfig,
+  type HistoricalStockBars,
   type BrokerAccountSnapshot,
   type BrokerOrderState,
   type BrokerPositionSnapshot,
   type OpenBrokerOrder,
   type SubmissionRecovery,
 } from "./alpaca.server.ts";
-import { MemoryAlpacaWorkerStore, SqlAlpacaWorkerStore, type AlpacaWorkerStore, type WorkerCheckpoint, type WorkerLease } from "./alpaca-worker-store.server.ts";
+import { MemoryAlpacaWorkerStore, SqlAlpacaWorkerStore, type AlpacaWorkerStore, type GapRecoveryAttempt, type WorkerCheckpoint, type WorkerLease } from "./alpaca-worker-store.server.ts";
 import { computeFeatures } from "./features.ts";
 import { buildJevRequest, createMockJevAdapter } from "./jev.ts";
 import type { MarketSource } from "./market.ts";
@@ -37,10 +39,15 @@ export const ALPACA_WORKER_TIMEFRAME = ALPACA_PAPER_DECISION_TIMEFRAME;
 export const ALPACA_WORKER_CONFIG_VERSION = ALPACA_PAPER_WORKER_VERSION;
 const OWNERSHIP_LEASE_SECONDS = 30;
 const OWNERSHIP_RENEW_INTERVAL_MS = 10_000;
+const DECISION_WIDTH_MS = 15 * 60_000;
+// computeFeatures currently gates readiness at index 20, so retain 21 complete
+// decision observations instead of changing the existing feature contract.
+const FEATURE_DECISION_OBSERVATIONS = 21;
 
 export type WorkerState = "STOPPED" | "STARTING" | "RECONCILING" | "READY" | "HALTED";
 export type WorkerStreamState = "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "DEGRADED" | "RECONCILING";
 export type FeatureContinuity = "HEALTHY" | "REBUILDING";
+export type RecoveryState = "HEALTHY" | "GAP_DETECTED" | "BACKFILLING" | "VERIFYING" | "REBUILDING";
 
 export type AlpacaWorkerSnapshot = {
   mode: "ALPACA_PAPER";
@@ -66,6 +73,10 @@ export type AlpacaWorkerSnapshot = {
   marketStreamState: WorkerStreamState;
   tradeUpdateStreamState: WorkerStreamState;
   featureContinuity: FeatureContinuity;
+  recoveryState: RecoveryState;
+  recoveryAttemptId: string | null;
+  recoveryMissingStartMs: number | null;
+  recoveryMissingEndMs: number | null;
   paperEquity: number | null;
   paperEquityHighWater: number | null;
   paperEquityDrawdown: number | null;
@@ -96,6 +107,7 @@ export type AlpacaPaperWorkerOptions = {
   broker: WorkerBroker;
   source?: MarketSource;
   tradeUpdates?: WorkerTradeUpdates;
+  historicalBars?: HistoricalStockBars;
   /** Makes exchange-session semantics injectable and deterministic in tests. */
   isRegularSession?: (timestamp: number) => boolean;
   now?: () => Date;
@@ -113,6 +125,12 @@ const emptyCheckpoint = (): WorkerCheckpoint => ({
   marketStreamState: "DISCONNECTED",
   tradeUpdateStreamState: "DISCONNECTED",
   featureContinuity: "REBUILDING",
+  recoveryState: "HEALTHY",
+  recoveryAttemptId: null,
+  recoveryMissingStartMs: null,
+  recoveryMissingEndMs: null,
+  recoveryCompletedAt: null,
+  recoveryDispatchNotBeforeBucketMs: null,
   paperEquityHighWater: null,
   lastPaperEquity: null,
   haltReason: null,
@@ -201,6 +219,10 @@ export class AlpacaPaperWorker {
       lastReconciliationTimestamp: this.checkpoint.lastReconciliationTimestamp, streamState: this.marketStreamState,
       marketStreamState: this.marketStreamState, tradeUpdateStreamState: this.tradeUpdateStreamState,
       featureContinuity: this.checkpoint.featureContinuity,
+      recoveryState: this.checkpoint.recoveryState,
+      recoveryAttemptId: this.checkpoint.recoveryAttemptId,
+      recoveryMissingStartMs: this.checkpoint.recoveryMissingStartMs,
+      recoveryMissingEndMs: this.checkpoint.recoveryMissingEndMs,
       paperEquity: this.checkpoint.lastPaperEquity, paperEquityHighWater: this.checkpoint.paperEquityHighWater,
       paperEquityDrawdown: this.paperEquityDrawdown(),
       haltReason: this.checkpoint.haltReason, missingDecisionBuckets: this.missingDecisionBuckets,
@@ -240,15 +262,15 @@ export class AlpacaPaperWorker {
     this.requiresPaperEquityHighWaterRecovery = storedCheckpoint !== null &&
       (typeof storedCheckpoint.paperEquityHighWater !== "number" || !Number.isFinite(storedCheckpoint.paperEquityHighWater));
     this.checkpoint = this.normalizeCheckpoint(storedCheckpoint ?? emptyCheckpoint());
-    this.marketStreamState = this.checkpoint.marketStreamState;
-    this.tradeUpdateStreamState = this.checkpoint.tradeUpdateStreamState;
+      this.marketStreamState = this.checkpoint.marketStreamState;
+      this.tradeUpdateStreamState = this.checkpoint.tradeUpdateStreamState;
     try {
       await this.reconcileInternal();
+      // A process may inherit durable raw bars that were recorded before it
+      // started. Repair only the bounded feature horizon before this run can
+      // create any new dispatch-eligible work.
+      await this.recoverStartupFeatureGaps();
       this.state = "READY";
-      // Durable bars may outlive a process that failed while atomically
-      // creating their decision/intent pair. Re-evaluate them after broker
-      // reconciliation; idempotent identity prevents duplicate dispatch.
-      await this.processCompletedDecisionBars();
       await this.persistCheckpoint();
       this.connectTradeUpdates();
       this.startMarketConsumer();
@@ -297,17 +319,34 @@ export class AlpacaPaperWorker {
   private async processRawBarInternal(bar: ClosedBar): Promise<void> {
     if (this.state !== "READY") return;
     if (!Number.isFinite(bar.t) || bar.t % 60_000 !== 0) return;
-    const inserted = await this.options.store.insertClosedBar(this.options.config.symbol, bar);
-    if (!inserted) return;
+    const observedAt = (this.options.now ?? (() => new Date()))().toISOString();
+    const priorLatest = this.checkpoint.latestRawBarTimestamp;
+    const write = await this.options.store.recordMarketBar({
+      symbol: this.options.config.symbol, bar, providerEventTimestampMs: bar.t, observedAt, origin: "LIVE_WS", recoveryAttemptId: null,
+    });
+    if (write === "CONFLICT") {
+      await this.enterRebuilding("LIVE_BAR_CONFLICT");
+      return;
+    }
+    if (write === "IDENTICAL") return;
     this.checkpoint.latestRawBarTimestamp = Math.max(this.checkpoint.latestRawBarTimestamp ?? 0, bar.t);
     await this.persistCheckpoint();
-    await this.processCompletedDecisionBars();
+    const gap = this.expectedLiveGap(priorLatest, bar.t);
+    if (gap) {
+      await this.recoverGap(gap.start, gap.end, observedAt);
+      return;
+    }
+    await this.processCompletedDecisionBars(Math.floor(bar.t / DECISION_WIDTH_MS) * DECISION_WIDTH_MS);
   }
 
-  private async processCompletedDecisionBars(): Promise<void> {
-    const raw = await this.options.store.listClosedBars(this.options.config.symbol);
+  private async processCompletedDecisionBars(eligibleBucketStart?: number, evaluateOnly = false): Promise<void> {
+    const rawStart = this.checkpoint.latestRawBarTimestamp === null ? undefined :
+      // Retain the in-progress bucket plus the 21 completed observations that
+      // the unchanged index-20 feature gate can require.
+      this.checkpoint.latestRawBarTimestamp - (FEATURE_DECISION_OBSERVATIONS + 1) * DECISION_WIDTH_MS;
+    const raw = await this.options.store.listClosedBars(this.options.config.symbol, rawStart);
     if (raw.length === 0) return;
-    const width = 15 * 60_000;
+    const width = DECISION_WIDTH_MS;
     const latestBucketStart = Math.floor(raw[raw.length - 1]!.t / width) * width;
     const buckets = new Map<number, ClosedBar[]>();
     for (const bar of raw) {
@@ -360,20 +399,34 @@ export class AlpacaPaperWorker {
     const continuousFeatures = computeFeatures(trailingContinuous);
     const warmupComplete = continuousFeatures.at(-1)?.warmupComplete ?? false;
     this.checkpoint.featureContinuity = warmupComplete ? "HEALTHY" : "REBUILDING";
+    // A failed repair can recover only by the unchanged full feature warmup;
+    // it never treats an incomplete REST response as continuity.
+    if (this.checkpoint.recoveryState === "REBUILDING" && warmupComplete) {
+      this.checkpoint.recoveryState = "HEALTHY";
+      this.checkpoint.recoveryCompletedAt ??= (this.options.now ?? (() => new Date()))().toISOString();
+    }
+    // Startup and recovery verification may establish continuity, but must
+    // never manufacture a decision or broker command for durable history.
+    if (evaluateOnly) return;
     // Decision evidence for a bucket must be calculated only from the current
     // contiguous run; no return, EMA, RSI, volatility, or trend bridges a gap.
     for (let index = 0; index < trailingContinuous.length; index += 1) {
       const decisionBar = trailingContinuous[index]!;
+      if (eligibleBucketStart !== undefined && decisionBar.t !== eligibleBucketStart) continue;
+      if (this.checkpoint.recoveryDispatchNotBeforeBucketMs !== null && decisionBar.t < this.checkpoint.recoveryDispatchNotBeforeBucketMs) continue;
       const decisionId = deterministicDecisionId(decisionBar.t, this.runtimeIdentity);
       const evidence = await this.decisionEvidence(trailingContinuous, index, decisionId);
       const inSession = (this.options.isRegularSession ?? ((timestamp) => isMarketSessionOpen(ALPACA_WORKER_ASSET, timestamp)))(decisionBar.t);
-      const dispatchEligible = inSession && evidence.features.warmupComplete;
+      const dispatchEligible = inSession && evidence.features.warmupComplete &&
+        this.checkpoint.featureContinuity === "HEALTHY" && this.checkpoint.recoveryState === "HEALTHY";
       const intent: ExecutionIntent = {
         intentId: `${decisionId}:intent`, decisionId, createdAtBar: index, createdAtTimestamp: decisionBar.t,
         desiredAction: evidence.action, desiredPosition: evidence.targetPosition, status: dispatchEligible ? "PENDING" : "CANCELLED",
         executionModel: "ALPACA_PAPER", clientOrderId: deterministicClientOrderId(decisionId),
       };
-      const blockReason = !inSession ? "OUTSIDE_REGULAR_SESSION" : !evidence.features.warmupComplete ? "FEATURE_CONTINUITY_REBUILDING" : null;
+      const blockReason = !inSession ? "OUTSIDE_REGULAR_SESSION" :
+        this.checkpoint.recoveryState !== "HEALTHY" ? `MARKET_RECOVERY_${this.checkpoint.recoveryState}` :
+          !evidence.features.warmupComplete ? "FEATURE_CONTINUITY_REBUILDING" : null;
       const persisted = await this.options.store.persistDecisionAndIntent(evidence, intent, blockReason);
       if (!persisted.inserted) continue;
       this.checkpoint.latestClosedDecisionBarTimestamp = decisionBar.t;
@@ -389,6 +442,121 @@ export class AlpacaPaperWorker {
       }
       await this.persistCheckpoint();
     }
+  }
+
+  private expectedLiveGap(previous: number | null, current: number): { start: number; end: number } | null {
+    if (previous === null || current <= previous + 60_000 || newYorkDate(previous) !== newYorkDate(current)) return null;
+    let start: number | null = null;
+    let end: number | null = null;
+    for (let timestamp = previous + 60_000; timestamp < current; timestamp += 60_000) {
+      if (!isMarketSessionOpen(ALPACA_WORKER_ASSET, timestamp)) continue;
+      start ??= timestamp;
+      end = timestamp + 60_000;
+    }
+    return start === null || end === null ? null : { start, end };
+  }
+
+  /**
+   * Scans exactly the raw interval used by feature construction and repairs
+   * persisted regular-session holes in deterministic oldest-first order.
+   */
+  private async recoverStartupFeatureGaps(): Promise<void> {
+    const latest = await this.options.store.latestClosedBarTimestamp(this.options.config.symbol);
+    if (latest === null) return;
+    this.checkpoint.latestRawBarTimestamp = Math.max(this.checkpoint.latestRawBarTimestamp ?? 0, latest);
+    const start = latest - (FEATURE_DECISION_OBSERVATIONS + 1) * DECISION_WIDTH_MS;
+    const raw = await this.options.store.listClosedBars(this.options.config.symbol, start, latest);
+    const present = new Set(raw.filter((bar) => Number.isFinite(bar.t) && bar.t % 60_000 === 0).map((bar) => bar.t));
+    const gaps: Array<{ start: number; end: number }> = [];
+    let gapStart: number | null = null;
+    for (let timestamp = start; timestamp <= latest; timestamp += 60_000) {
+      const missingRegularBar = isMarketSessionOpen(ALPACA_WORKER_ASSET, timestamp) && !present.has(timestamp);
+      if (missingRegularBar) {
+        gapStart ??= timestamp;
+        continue;
+      }
+      if (gapStart !== null) {
+        gaps.push({ start: gapStart, end: timestamp });
+        gapStart = null;
+      }
+    }
+    if (gapStart !== null) gaps.push({ start: gapStart, end: latest + 60_000 });
+    const detectedAt = (this.options.now ?? (() => new Date()))().toISOString();
+    for (const gap of gaps) await this.recoverGap(gap.start, gap.end, detectedAt, true);
+    // Even when no gap exists, startup must calculate the feature-continuity
+    // state without replaying decisions from durable history.
+    await this.processCompletedDecisionBars(undefined, true);
+  }
+
+  private async recoverGap(start: number, end: number, detectedAt: string, evaluateOnly = false): Promise<void> {
+    const recoveryAttemptId = randomUUID();
+    const dispatchNotBefore = (Math.floor(Date.parse(detectedAt) / DECISION_WIDTH_MS) + 1) * DECISION_WIDTH_MS;
+    let attempt: GapRecoveryAttempt = {
+      recoveryAttemptId, workerKey: this.key, symbol: "SPY", missingStartMs: start, missingEndMs: end,
+      state: "GAP_DETECTED", detectedAt, result: null, reason: null,
+    };
+    await this.options.store.createGapRecoveryAttempt(attempt);
+    this.checkpoint.recoveryState = "GAP_DETECTED";
+    this.checkpoint.recoveryAttemptId = recoveryAttemptId;
+    this.checkpoint.recoveryMissingStartMs = start;
+    this.checkpoint.recoveryMissingEndMs = end;
+    this.checkpoint.recoveryDispatchNotBeforeBucketMs = Math.max(this.checkpoint.recoveryDispatchNotBeforeBucketMs ?? 0, dispatchNotBefore);
+    await this.persistCheckpoint();
+    try {
+      const requestedAt = (this.options.now ?? (() => new Date()))().toISOString();
+      attempt = { ...attempt, state: "BACKFILLING", requestedAt };
+      await this.options.store.updateGapRecoveryAttempt(attempt);
+      this.checkpoint.recoveryState = "BACKFILLING";
+      await this.persistCheckpoint();
+      const source = this.options.historicalBars ?? new AlpacaHistoricalStockBars(this.options.config);
+      const bars = await source.bars({ symbol: "SPY", start, end });
+      const expected = Array.from({ length: (end - start) / 60_000 }, (_, index) => start + index * 60_000);
+      const byTimestamp = new Map(bars.map((bar) => [bar.t, bar]));
+      const structurallyValid = bars.every((bar) => Number.isFinite(bar.t) && bar.t % 60_000 === 0 && bar.t >= start && bar.t < end &&
+        [bar.open, bar.high, bar.low, bar.close, bar.volume].every(Number.isFinite) && bar.volume >= 0 &&
+        bar.low <= Math.min(bar.open, bar.close) && bar.high >= Math.max(bar.open, bar.close) && bar.high >= bar.low);
+      if (!structurallyValid || bars.length !== expected.length || byTimestamp.size !== expected.length || expected.some((timestamp) => !byTimestamp.has(timestamp))) {
+        const reason = structurallyValid ? "PARTIAL_BACKFILL" : "INVALID_BACKFILL_BAR";
+        await this.enterRebuilding(reason, { ...attempt, state: "REBUILDING", returnedBarCount: bars.length, reason });
+        return;
+      }
+      const verifiedAt = (this.options.now ?? (() => new Date()))().toISOString();
+      attempt = { ...attempt, state: "VERIFYING", returnedBarCount: bars.length, verifiedAt };
+      await this.options.store.updateGapRecoveryAttempt(attempt);
+      this.checkpoint.recoveryState = "VERIFYING";
+      await this.persistCheckpoint();
+      for (const timestamp of expected) {
+        const bar = byTimestamp.get(timestamp)!;
+        const result = await this.options.store.recordMarketBar({
+          symbol: "SPY", bar, providerEventTimestampMs: bar.t, observedAt: verifiedAt, origin: "REST_BACKFILL", recoveryAttemptId,
+        });
+        if (result === "CONFLICT") {
+          await this.enterRebuilding("BACKFILL_BAR_CONFLICT", { ...attempt, state: "REBUILDING", verifiedBarCount: 0, reason: "BACKFILL_BAR_CONFLICT" });
+          return;
+        }
+      }
+      // The barrier uses verification completion, never merely gap detection:
+      // queued live bars from a slow REST request cannot become retroactive.
+      const completedAt = (this.options.now ?? (() => new Date()))().toISOString();
+      const completionBarrier = (Math.floor(Date.parse(completedAt) / DECISION_WIDTH_MS) + 1) * DECISION_WIDTH_MS;
+      this.checkpoint.recoveryCompletedAt = completedAt;
+      this.checkpoint.recoveryDispatchNotBeforeBucketMs = Math.max(this.checkpoint.recoveryDispatchNotBeforeBucketMs ?? 0, completionBarrier);
+      await this.processCompletedDecisionBars(undefined, evaluateOnly);
+      const restored = this.checkpoint.featureContinuity === "HEALTHY";
+      this.checkpoint.recoveryState = restored ? "HEALTHY" : "REBUILDING";
+      attempt = { ...attempt, state: this.checkpoint.recoveryState, verifiedBarCount: bars.length, completedAt, result: restored ? "VERIFIED" : "FEATURE_WARMUP_REQUIRED", reason: restored ? null : "FEATURE_WARMUP_REQUIRED" };
+      await this.options.store.updateGapRecoveryAttempt(attempt);
+      await this.persistCheckpoint();
+    } catch (error) {
+      await this.enterRebuilding("BACKFILL_REQUEST_FAILED", { ...attempt, state: "REBUILDING", reason: error instanceof Error ? "BACKFILL_REQUEST_FAILED" : "BACKFILL_UNKNOWN_FAILURE" });
+    }
+  }
+
+  private async enterRebuilding(reason: string, attempt?: GapRecoveryAttempt): Promise<void> {
+    this.checkpoint.recoveryState = "REBUILDING";
+    this.checkpoint.featureContinuity = "REBUILDING";
+    if (attempt) await this.options.store.updateGapRecoveryAttempt({ ...attempt, state: "REBUILDING", result: attempt.result ?? reason, reason });
+    await this.persistCheckpoint();
   }
 
   private async decisionEvidence(candles: ClosedBar[], index: number, decisionId: string): Promise<Evidence> {
@@ -658,6 +826,12 @@ export class AlpacaPaperWorker {
       marketStreamState: checkpoint.marketStreamState ?? legacyState,
       tradeUpdateStreamState: checkpoint.tradeUpdateStreamState ?? "DISCONNECTED",
       featureContinuity: checkpoint.featureContinuity ?? "REBUILDING",
+      recoveryState: checkpoint.recoveryState ?? "HEALTHY",
+      recoveryAttemptId: checkpoint.recoveryAttemptId ?? null,
+      recoveryMissingStartMs: Number.isFinite(checkpoint.recoveryMissingStartMs) ? checkpoint.recoveryMissingStartMs : null,
+      recoveryMissingEndMs: Number.isFinite(checkpoint.recoveryMissingEndMs) ? checkpoint.recoveryMissingEndMs : null,
+      recoveryCompletedAt: checkpoint.recoveryCompletedAt ?? null,
+      recoveryDispatchNotBeforeBucketMs: Number.isFinite(checkpoint.recoveryDispatchNotBeforeBucketMs) ? checkpoint.recoveryDispatchNotBeforeBucketMs : null,
       paperEquityHighWater: Number.isFinite(checkpoint.paperEquityHighWater) ? checkpoint.paperEquityHighWater : null,
       lastPaperEquity: Number.isFinite(checkpoint.lastPaperEquity) ? checkpoint.lastPaperEquity : null,
     };

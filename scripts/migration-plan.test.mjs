@@ -61,6 +61,9 @@ test("the auth schema ships outside the globbed directory", () => {
   assert.deepEqual(pendingMigrations(readdirSync(migrationsDir), []), [
     { name: "0002_alpaca_paper_worker.sql", path: "0002_alpaca_paper_worker.sql" },
     { name: "0003_alpaca_paper_worker_hardening.sql", path: "0003_alpaca_paper_worker_hardening.sql" },
+    { name: "0004_alpaca_paper_worker_ownership.sql", path: "0004_alpaca_paper_worker_ownership.sql" },
+    { name: "0005_alpaca_paper_worker_legacy_run_key.sql", path: "0005_alpaca_paper_worker_legacy_run_key.sql" },
+    { name: "0006_alpaca_paper_market_recovery.sql", path: "0006_alpaca_paper_market_recovery.sql" },
   ]);
   assert.ok(readdirSync(join(migrationsDir, "auth")).includes("0001_auth.sql"));
 });

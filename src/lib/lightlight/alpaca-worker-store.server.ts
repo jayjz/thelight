@@ -13,9 +13,42 @@ export type WorkerCheckpoint = {
   marketStreamState: "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "DEGRADED" | "RECONCILING";
   tradeUpdateStreamState: "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "DEGRADED" | "RECONCILING";
   featureContinuity: "HEALTHY" | "REBUILDING";
+  recoveryState: "HEALTHY" | "GAP_DETECTED" | "BACKFILLING" | "VERIFYING" | "REBUILDING";
+  recoveryAttemptId: string | null;
+  recoveryMissingStartMs: number | null;
+  recoveryMissingEndMs: number | null;
+  recoveryCompletedAt: string | null;
+  recoveryDispatchNotBeforeBucketMs: number | null;
   paperEquityHighWater: number | null;
   lastPaperEquity: number | null;
   haltReason: string | null;
+};
+
+export type MarketBarOrigin = "LIVE_WS" | "REST_BACKFILL";
+export type MarketBarObservation = {
+  symbol: string;
+  bar: ClosedBar;
+  providerEventTimestampMs: number;
+  observedAt: string;
+  origin: MarketBarOrigin;
+  recoveryAttemptId: string | null;
+};
+export type MarketBarWriteResult = "ACCEPTED" | "IDENTICAL" | "CONFLICT";
+export type GapRecoveryAttempt = {
+  recoveryAttemptId: string;
+  workerKey: string;
+  symbol: string;
+  missingStartMs: number;
+  missingEndMs: number;
+  state: "GAP_DETECTED" | "BACKFILLING" | "VERIFYING" | "HEALTHY" | "REBUILDING";
+  detectedAt: string;
+  requestedAt?: string | null;
+  verifiedAt?: string | null;
+  completedAt?: string | null;
+  returnedBarCount?: number;
+  verifiedBarCount?: number;
+  result?: string | null;
+  reason?: string | null;
 };
 
 export type StoredIntent = {
@@ -55,7 +88,13 @@ export interface AlpacaWorkerStore {
    */
   withDispatchAuthority<T>(lease: WorkerLease, intentId: string, scope: DurableWorkerScope, submit: () => Promise<T>): Promise<T | null>;
   insertClosedBar(symbol: string, bar: ClosedBar): Promise<boolean>;
-  listClosedBars(symbol: string): Promise<ClosedBar[]>;
+  recordMarketBar(observation: MarketBarObservation): Promise<MarketBarWriteResult>;
+  /** Reads the newest persisted raw bar without loading feature history. */
+  latestClosedBarTimestamp(symbol: string): Promise<number | null>;
+  /** Optional bounds keep restart recovery reads limited to feature history. */
+  listClosedBars(symbol: string, fromTimestampMs?: number, throughTimestampMs?: number): Promise<ClosedBar[]>;
+  createGapRecoveryAttempt(attempt: GapRecoveryAttempt): Promise<void>;
+  updateGapRecoveryAttempt(attempt: GapRecoveryAttempt): Promise<void>;
   /** Atomically creates immutable evidence and its initial durable intent. */
   persistDecisionAndIntent(evidence: Evidence, intent: ExecutionIntent, dispatchBlockReason?: string | null): Promise<{ inserted: boolean }>;
   putIntent(intent: ExecutionIntent, dispatchBlockReason?: string | null): Promise<void>;
@@ -181,18 +220,58 @@ export class SqlAlpacaWorkerStore implements AlpacaWorkerStore {
   }
 
   async insertClosedBar(symbol: string, bar: ClosedBar): Promise<boolean> {
-    const sql = await this.sqlProvider();
-    const rows = await sql.query<{ timestamp_ms: number }>(
-      "insert into closed_bars (symbol, timestamp_ms, bar_json, received_at) values ($1, $2, $3, $4) on conflict do nothing returning timestamp_ms",
-      [symbol, bar.t, JSON.stringify(bar), nowIso()],
-    );
-    return rows.length === 1;
+    return (await this.recordMarketBar({ symbol, bar, providerEventTimestampMs: bar.t, observedAt: nowIso(), origin: "LIVE_WS", recoveryAttemptId: null })) === "ACCEPTED";
   }
 
-  async listClosedBars(symbol: string): Promise<ClosedBar[]> {
+  async recordMarketBar(observation: MarketBarObservation): Promise<MarketBarWriteResult> {
     const sql = await this.sqlProvider();
-    const rows = await sql.query<{ bar_json: string }>("select bar_json from closed_bars where symbol = $1 order by timestamp_ms asc", [symbol]);
+    return sql.transaction(async (tx) => {
+      const inserted = await tx.query<{ timestamp_ms: number }>(
+        "insert into closed_bars (symbol, timestamp_ms, bar_json, received_at) values ($1, $2, $3, $4) on conflict do nothing returning timestamp_ms",
+        [observation.symbol, observation.bar.t, JSON.stringify(observation.bar), observation.observedAt],
+      );
+      let result: MarketBarWriteResult = "ACCEPTED";
+      if (inserted.length === 0) {
+        const existing = await tx.query<{ bar_json: string }>("select bar_json from closed_bars where symbol = $1 and timestamp_ms = $2", [observation.symbol, observation.bar.t]);
+        const prior = existing[0] ? JSON.parse(existing[0].bar_json) as ClosedBar : null;
+        result = prior && prior.t === observation.bar.t && prior.open === observation.bar.open && prior.high === observation.bar.high && prior.low === observation.bar.low && prior.close === observation.bar.close && prior.volume === observation.bar.volume ? "IDENTICAL" : "CONFLICT";
+      }
+      await tx.query(
+        "insert into market_bar_observations (observation_id, symbol, timestamp_ms, provider_event_timestamp_ms, observed_at, origin, recovery_attempt_id, verification_result, bar_json) values ($1, $2, $3, $4, $5, $6, $7, $8, $9) on conflict (symbol, timestamp_ms, origin, recovery_attempt_id) do nothing",
+        [randomUUID(), observation.symbol, observation.bar.t, observation.providerEventTimestampMs, observation.observedAt, observation.origin, observation.recoveryAttemptId ?? "", result, JSON.stringify(observation.bar)],
+      );
+      return result;
+    });
+  }
+
+  async latestClosedBarTimestamp(symbol: string): Promise<number | null> {
+    const sql = await this.sqlProvider();
+    const rows = await sql.query<{ timestamp_ms: number | string | null }>("select max(timestamp_ms) as timestamp_ms from closed_bars where symbol = $1", [symbol]);
+    const timestamp = rows[0]?.timestamp_ms;
+    return typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp :
+      typeof timestamp === "string" && Number.isFinite(Number(timestamp)) ? Number(timestamp) : null;
+  }
+
+  async listClosedBars(symbol: string, fromTimestampMs?: number, throughTimestampMs?: number): Promise<ClosedBar[]> {
+    const sql = await this.sqlProvider();
+    const rows = await sql.query<{ bar_json: string }>("select bar_json from closed_bars where symbol = $1 and ($2::bigint is null or timestamp_ms >= $2) and ($3::bigint is null or timestamp_ms <= $3) order by timestamp_ms asc", [symbol, fromTimestampMs ?? null, throughTimestampMs ?? null]);
     return rows.map((row) => JSON.parse(row.bar_json) as ClosedBar);
+  }
+
+  async createGapRecoveryAttempt(attempt: GapRecoveryAttempt): Promise<void> {
+    const sql = await this.sqlProvider();
+    await sql.query(
+      "insert into market_gap_recovery_attempts (recovery_attempt_id, worker_key, symbol, missing_start_ms, missing_end_ms, state, detected_at, requested_at, verified_at, completed_at, returned_bar_count, verified_bar_count, result, reason) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+      [attempt.recoveryAttemptId, attempt.workerKey, attempt.symbol, attempt.missingStartMs, attempt.missingEndMs, attempt.state, attempt.detectedAt, attempt.requestedAt ?? null, attempt.verifiedAt ?? null, attempt.completedAt ?? null, attempt.returnedBarCount ?? 0, attempt.verifiedBarCount ?? 0, attempt.result ?? null, attempt.reason ?? null],
+    );
+  }
+
+  async updateGapRecoveryAttempt(attempt: GapRecoveryAttempt): Promise<void> {
+    const sql = await this.sqlProvider();
+    await sql.query(
+      "update market_gap_recovery_attempts set state = $2, requested_at = $3, verified_at = $4, completed_at = $5, returned_bar_count = $6, verified_bar_count = $7, result = $8, reason = $9 where recovery_attempt_id = $1",
+      [attempt.recoveryAttemptId, attempt.state, attempt.requestedAt ?? null, attempt.verifiedAt ?? null, attempt.completedAt ?? null, attempt.returnedBarCount ?? 0, attempt.verifiedBarCount ?? 0, attempt.result ?? null, attempt.reason ?? null],
+    );
   }
 
   async persistDecisionAndIntent(evidence: Evidence, intent: ExecutionIntent, dispatchBlockReason: string | null = null): Promise<{ inserted: boolean }> {
@@ -289,6 +368,8 @@ export class MemoryAlpacaWorkerStore implements AlpacaWorkerStore {
   readonly updates: Array<{ update: Record<string, unknown>; clientOrderId: string | null }> = [];
   checkpointReads = 0;
   private readonly bars = new Map<string, ClosedBar>();
+  private readonly observations: Array<MarketBarObservation & { verificationResult: MarketBarWriteResult }> = [];
+  private readonly recoveryAttempts = new Map<string, GapRecoveryAttempt>();
   private readonly decisions = new Map<string, Evidence>();
   private readonly intents = new Map<string, StoredIntent>();
   private readonly checkpoints = new Map<string, WorkerCheckpoint>();
@@ -331,14 +412,31 @@ export class MemoryAlpacaWorkerStore implements AlpacaWorkerStore {
     return submit();
   }
   async insertClosedBar(symbol: string, bar: ClosedBar): Promise<boolean> {
-    const key = `${symbol}:${bar.t}`;
-    if (this.bars.has(key)) return false;
-    this.bars.set(key, clone(bar));
-    return true;
+    return (await this.recordMarketBar({ symbol, bar, providerEventTimestampMs: bar.t, observedAt: nowIso(), origin: "LIVE_WS", recoveryAttemptId: null })) === "ACCEPTED";
   }
-  async listClosedBars(symbol: string): Promise<ClosedBar[]> {
-    return [...this.bars.entries()].filter(([key]) => key.startsWith(`${symbol}:`)).map(([, bar]) => clone(bar)).sort((a, b) => a.t - b.t);
+  async recordMarketBar(observation: MarketBarObservation): Promise<MarketBarWriteResult> {
+    const key = `${observation.symbol}:${observation.bar.t}`;
+    const prior = this.bars.get(key);
+    const result: MarketBarWriteResult = !prior ? "ACCEPTED" :
+      prior.t === observation.bar.t && prior.open === observation.bar.open && prior.high === observation.bar.high && prior.low === observation.bar.low && prior.close === observation.bar.close && prior.volume === observation.bar.volume ? "IDENTICAL" : "CONFLICT";
+    if (!prior) this.bars.set(key, clone(observation.bar));
+    const duplicate = this.observations.some((existing) => existing.symbol === observation.symbol && existing.bar.t === observation.bar.t && existing.origin === observation.origin && existing.recoveryAttemptId === observation.recoveryAttemptId);
+    if (!duplicate) this.observations.push({ ...clone(observation), verificationResult: result });
+    return result;
   }
+  async latestClosedBarTimestamp(symbol: string): Promise<number | null> {
+    const timestamps = [...this.bars.entries()]
+      .filter(([key]) => key.startsWith(`${symbol}:`))
+      .map(([, bar]) => bar.t);
+    return timestamps.length === 0 ? null : Math.max(...timestamps);
+  }
+  async listClosedBars(symbol: string, fromTimestampMs?: number, throughTimestampMs?: number): Promise<ClosedBar[]> {
+    return [...this.bars.entries()].filter(([key, bar]) => key.startsWith(`${symbol}:`) &&
+      (fromTimestampMs === undefined || bar.t >= fromTimestampMs) &&
+      (throughTimestampMs === undefined || bar.t <= throughTimestampMs)).map(([, bar]) => clone(bar)).sort((a, b) => a.t - b.t);
+  }
+  async createGapRecoveryAttempt(attempt: GapRecoveryAttempt): Promise<void> { this.recoveryAttempts.set(attempt.recoveryAttemptId, clone(attempt)); }
+  async updateGapRecoveryAttempt(attempt: GapRecoveryAttempt): Promise<void> { this.recoveryAttempts.set(attempt.recoveryAttemptId, clone(attempt)); }
   failNextIntentPersistence = false;
   async persistDecisionAndIntent(evidence: Evidence, intent: ExecutionIntent, dispatchBlockReason: string | null = null): Promise<{ inserted: boolean }> {
     if (this.decisions.has(evidence.id)) {
@@ -377,4 +475,6 @@ export class MemoryAlpacaWorkerStore implements AlpacaWorkerStore {
   decisionCount(): number { return this.decisions.size; }
   intentCount(): number { return this.intents.size; }
   decisionEvidence(): Evidence[] { return [...this.decisions.values()].map(clone); }
+  marketObservations(): Array<MarketBarObservation & { verificationResult: MarketBarWriteResult }> { return this.observations.map(clone); }
+  recoveryAttempt(id: string): GapRecoveryAttempt | null { return this.recoveryAttempts.has(id) ? clone(this.recoveryAttempts.get(id)!) : null; }
 }

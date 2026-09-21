@@ -4,6 +4,7 @@ import {
   ALPACA_DATA_BASE_URL,
   ALPACA_PAPER_BASE_URL,
   AlpacaPaperExecution,
+  AlpacaHistoricalStockBars,
   AlpacaPaperTradeUpdates,
   AlpacaMarketSource,
   AlpacaTransportError,
@@ -130,6 +131,29 @@ describe("Alpaca paper boundaries", () => {
     const message = { T: "b" as const, S: "SPY", o: 1, h: 2, l: 0.5, c: 1.5, v: 10, t: "2026-01-01T00:00:00Z" };
     assert.equal(closedBarFromAlpaca(message, Date.parse("2026-01-01T00:00:30Z")), null);
     assert.equal(closedBarFromAlpaca(message, Date.parse("2026-01-01T00:01:00Z"))?.close, 1.5);
+  });
+
+  it("uses a read-only fixed SPY/IEX 1Min historical boundary", async () => {
+    let requested = "";
+    const historical = new AlpacaHistoricalStockBars(loadAlpacaConfig(env), async (url) => {
+      requested = String(url);
+      return new Response(JSON.stringify({ bars: { SPY: [{ t: "2026-01-01T00:00:00Z", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 }] } }), { status: 200 });
+    });
+    const bars = await historical.bars({ symbol: "SPY", start: Date.parse("2026-01-01T00:00:00Z"), end: Date.parse("2026-01-01T00:01:00Z") });
+    assert.equal(bars.length, 1);
+    assert.match(requested, /\/v2\/stocks\/bars\?/);
+    assert.match(requested, /timeframe=1Min/); assert.match(requested, /feed=iex/); assert.match(requested, /symbols=SPY/);
+  });
+
+  it("rejects malformed or duplicate historical bars rather than filling a gap", async () => {
+    const historical = new AlpacaHistoricalStockBars(loadAlpacaConfig(env), async () => new Response(JSON.stringify({ bars: { SPY: [
+      { t: "2026-01-01T00:00:00Z", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 },
+      { t: "2026-01-01T00:00:00Z", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 },
+    ] } }), { status: 200 }));
+    await assert.rejects(
+      historical.bars({ symbol: "SPY", start: Date.parse("2026-01-01T00:00:00Z"), end: Date.parse("2026-01-01T00:01:00Z") }),
+      /duplicate timestamps/,
+    );
   });
 
   it("normalizes string, Blob, and ArrayBuffer WebSocket payloads to UTF-8 text", async () => {

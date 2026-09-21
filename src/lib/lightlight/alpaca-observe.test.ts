@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import {
   ObserverChangeDetector,
   classifyContinuity,
+  classifyRecovery,
   classifyLease,
   classifyStream,
   formatEt,
@@ -41,6 +42,7 @@ function snapshot(overrides: Partial<ObserverSnapshot> = {}): ObserverSnapshot {
       marketStreamState: "CONNECTED",
       tradeUpdateStreamState: "CONNECTED",
       featureContinuity: "HEALTHY",
+      recoveryState: "HEALTHY",
       latestRawBarTimestamp: decisionTime,
       latestClosedDecisionBarTimestamp: decisionTime,
       latestDecisionId: "LLP-decision-0000000000000000",
@@ -57,6 +59,7 @@ function snapshot(overrides: Partial<ObserverSnapshot> = {}): ObserverSnapshot {
     decisions: [decision()],
     brokerOrders: [],
     tradeUpdates: [],
+    recovery: null,
     ...overrides,
   };
 }
@@ -74,6 +77,15 @@ describe("Alpaca PAPER terminal observer", () => {
     const output = renderCurrentState(snapshot({ checkpoint: { ...snapshot().checkpoint!, featureContinuity: "REBUILDING" } }));
     assert.match(output, /🟡 CONTINUITY\s+rebuilding \(safe gate\)/);
     assert.doesNotMatch(output, /🟢 CONTINUITY/);
+  });
+
+  it("renders every durable market-recovery state without exposing provider payloads", () => {
+    assert.equal(classifyRecovery("GAP_DETECTED").label, "gap detected (safe gate)");
+    assert.equal(classifyRecovery("BACKFILLING").label, "backfilling (safe gate)");
+    assert.equal(classifyRecovery("VERIFYING").label, "verifying (safe gate)");
+    assert.equal(classifyRecovery("REBUILDING").label, "rebuilding (safe gate)");
+    const recovery = { recoveryAttemptId: "attempt-1", state: "HEALTHY", missingStartMs: decisionTime, missingEndMs: decisionTime + 60_000, detectedAt: "2026-09-21T15:45:01.000Z", requestedAt: "2026-09-21T15:45:02.000Z", verifiedAt: "2026-09-21T15:45:03.000Z", completedAt: "2026-09-21T15:45:03.000Z", returnedBarCount: 1, verifiedBarCount: 1, result: "VERIFIED", reason: null };
+    assert.match(renderEvent({ kind: "recovery", recovery }), /✅ backfill verified 1 bar; 🧠 continuity restored/);
   });
 
   it("renders a durable halt reason prominently", () => {

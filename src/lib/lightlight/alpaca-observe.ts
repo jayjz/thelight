@@ -17,6 +17,7 @@ export type ObserverCheckpoint = {
   marketStreamState: string | null;
   tradeUpdateStreamState: string | null;
   featureContinuity: string | null;
+  recoveryState: string | null;
   latestRawBarTimestamp: number | null;
   latestClosedDecisionBarTimestamp: number | null;
   latestDecisionId: string | null;
@@ -24,6 +25,21 @@ export type ObserverCheckpoint = {
   paperEquity: number | null;
   haltReason: string | null;
   updatedAt: string | null;
+};
+
+export type ObserverRecovery = {
+  recoveryAttemptId: string;
+  state: string;
+  missingStartMs: number | null;
+  missingEndMs: number | null;
+  detectedAt: string | null;
+  requestedAt: string | null;
+  verifiedAt: string | null;
+  completedAt: string | null;
+  returnedBarCount: number;
+  verifiedBarCount: number;
+  result: string | null;
+  reason: string | null;
 };
 
 export type ObserverLease = {
@@ -92,6 +108,7 @@ export type ObserverSnapshot = {
   decisions: ObserverDecision[];
   brokerOrders: ObserverBrokerOrder[];
   tradeUpdates: ObserverTradeUpdate[];
+  recovery: ObserverRecovery | null;
 };
 
 export type ObserverEvent =
@@ -99,7 +116,8 @@ export type ObserverEvent =
   | { kind: "decision"; decision: ObserverDecision }
   | { kind: "intent"; intent: ObserverIntent }
   | { kind: "broker"; order: ObserverBrokerOrder }
-  | { kind: "trade-update"; update: ObserverTradeUpdate };
+  | { kind: "trade-update"; update: ObserverTradeUpdate }
+  | { kind: "recovery"; recovery: ObserverRecovery };
 
 function asRecord(value: unknown): JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
@@ -138,6 +156,7 @@ function checkpointFrom(row: JsonRecord | undefined): ObserverCheckpoint | null 
     marketStreamState: asString(checkpoint.marketStreamState ?? checkpoint.streamState),
     tradeUpdateStreamState: asString(checkpoint.tradeUpdateStreamState),
     featureContinuity: asString(checkpoint.featureContinuity),
+    recoveryState: asString(checkpoint.recoveryState),
     latestRawBarTimestamp: asNumber(checkpoint.latestRawBarTimestamp),
     latestClosedDecisionBarTimestamp: asNumber(checkpoint.latestClosedDecisionBarTimestamp),
     latestDecisionId: asString(checkpoint.latestDecisionId),
@@ -199,11 +218,13 @@ export async function loadObserverSnapshot(
   const decisionResult = await query.query("select d.decision_id, d.decision_timestamp_ms::text, d.evidence_json, d.created_at::text as decision_created_at, i.intent_id, i.decision_id, i.status as intent_status, i.intent_json, i.dispatch_block_reason, i.updated_at::text as intent_updated_at from decisions d left join execution_intents i on i.decision_id = d.decision_id where d.symbol = $1 order by d.decision_timestamp_ms desc, d.created_at desc limit 12", [symbol]);
   const brokerResult = await query.query("select b.event_id, b.intent_id, b.broker_order_id, b.status, b.lookup_state, b.observed_at::text from broker_orders b join execution_intents i on i.intent_id = b.intent_id join decisions d on d.decision_id = i.decision_id where d.symbol = $1 order by b.observed_at desc, b.event_id desc limit 20", [symbol]);
   const updateResult = await query.query("select update_id, client_order_id, received_at::text from trade_updates order by received_at desc, update_id desc limit 20");
+  const recoveryResult = await query.query("select recovery_attempt_id, state, missing_start_ms::text, missing_end_ms::text, detected_at::text, requested_at::text, verified_at::text, completed_at::text, returned_bar_count, verified_bar_count, result, reason from market_gap_recovery_attempts where worker_key = $1 and symbol = $2 order by detected_at desc limit 1", [workerKey, symbol]);
 
   const checkpoint = checkpointFrom(checkpointResult.rows[0]);
   const leaseRow = leaseResult.rows[0];
   const runRow = runResult.rows[0];
   const positionRow = positionResult.rows[0];
+  const recoveryRow = recoveryResult.rows[0];
   return {
     workerKey,
     symbol,
@@ -238,6 +259,15 @@ export async function loadObserverSnapshot(
       clientOrderId: asString(row.client_order_id),
       receivedAt: asString(row.received_at),
     })),
+    recovery: recoveryRow ? {
+      recoveryAttemptId: asString(recoveryRow.recovery_attempt_id) ?? "unknown",
+      state: asString(recoveryRow.state) ?? "UNKNOWN",
+      missingStartMs: asNumber(recoveryRow.missing_start_ms), missingEndMs: asNumber(recoveryRow.missing_end_ms),
+      detectedAt: asString(recoveryRow.detected_at), requestedAt: asString(recoveryRow.requested_at),
+      verifiedAt: asString(recoveryRow.verified_at), completedAt: asString(recoveryRow.completed_at),
+      returnedBarCount: asNumber(recoveryRow.returned_bar_count) ?? 0, verifiedBarCount: asNumber(recoveryRow.verified_bar_count) ?? 0,
+      result: asString(recoveryRow.result), reason: asString(recoveryRow.reason),
+    } : null,
   };
 }
 
@@ -290,6 +320,15 @@ export function classifyContinuity(state: string | null): Health {
   return { icon: "🟡", label: "waiting" };
 }
 
+export function classifyRecovery(state: string | null): Health {
+  if (state === "HEALTHY") return { icon: "🟢", label: "healthy" };
+  if (state === "GAP_DETECTED") return { icon: "⚠", label: "gap detected (safe gate)" };
+  if (state === "BACKFILLING") return { icon: "🔧", label: "backfilling (safe gate)" };
+  if (state === "VERIFYING") return { icon: "🔎", label: "verifying (safe gate)" };
+  if (state === "REBUILDING") return { icon: "🟡", label: "rebuilding (safe gate)" };
+  return { icon: "🟡", label: "waiting" };
+}
+
 export function classifyLease(lease: ObserverLease | null): Health {
   if (!lease) return { icon: "🔴", label: "no durable lease" };
   return lease.live ? { icon: "🟢", label: "lease live" } : { icon: "🔴", label: "lease expired" };
@@ -321,6 +360,7 @@ export function renderCurrentState(snapshot: ObserverSnapshot, options: { verbos
   const market = classifyStream(checkpoint?.marketStreamState ?? null);
   const trade = classifyStream(checkpoint?.tradeUpdateStreamState ?? null);
   const continuity = classifyContinuity(checkpoint?.featureContinuity ?? null);
+  const recovery = classifyRecovery(checkpoint?.recoveryState ?? snapshot.recovery?.state ?? null);
   const lease = classifyLease(snapshot.lease);
   const haltReason = checkpoint?.haltReason ?? snapshot.run?.haltReason;
   const leaseToken = snapshot.lease?.fencingToken === null || !snapshot.lease ? "" : ` token=${snapshot.lease.fencingToken}`;
@@ -331,6 +371,7 @@ export function renderCurrentState(snapshot: ObserverSnapshot, options: { verbos
     `${market.icon} MARKET       ${market.label.padEnd(16)} last bar ${formatEt(snapshot.latestRawBarTimestamp)}`,
     `${trade.icon} TRADE FEED   ${trade.label.padEnd(16)} last update ${formatEt(snapshot.latestTradeUpdateAt)}`,
     `${continuity.icon} CONTINUITY   ${continuity.label}`,
+    `${recovery.icon} RECOVERY     ${recovery.label}${snapshot.recovery?.missingStartMs === null || !snapshot.recovery ? "" : ` ${formatEt(snapshot.recovery.missingStartMs)}–${formatEt((snapshot.recovery.missingEndMs ?? snapshot.recovery.missingStartMs) - 60_000)}`}`,
     `🔐 OWNERSHIP    ${lease.label}${leaseToken}`,
     `💰 PAPER        position=${snapshot.paperPosition?.quantity ?? "waiting"}  equity=${formatMoney(checkpoint?.paperEquity ?? null)}`,
     haltReason ? `🔴 SAFETY       HALTED — ${sanitizeTerminalText(haltReason)}` : "🟢 SAFETY       no durable halt",
@@ -359,6 +400,7 @@ function eventTime(event: ObserverEvent): number {
   if (event.kind === "decision") return event.decision.timestamp ?? (Date.parse(event.decision.createdAt ?? "") || 0);
   if (event.kind === "intent") return Date.parse(event.intent.updatedAt ?? "") || 0;
   if (event.kind === "broker") return Date.parse(event.order.observedAt ?? "") || 0;
+  if (event.kind === "recovery") return Date.parse(event.recovery.completedAt ?? event.recovery.verifiedAt ?? event.recovery.requestedAt ?? event.recovery.detectedAt ?? "") || 0;
   return Date.parse(event.update.receivedAt ?? "") || 0;
 }
 
@@ -369,6 +411,16 @@ export function renderEvent(event: ObserverEvent): string {
   if (event.kind === "broker") {
     const id = sanitizeIdentifier(event.order.brokerOrderId);
     return `${formatEt(event.order.observedAt, true)} ${brokerIcon(event.order.status)} broker ${event.order.status}${id ? ` id=${id}` : ""}`;
+  }
+  if (event.kind === "recovery") {
+    const recovery = event.recovery;
+    const time = recovery.completedAt ?? recovery.verifiedAt ?? recovery.requestedAt ?? recovery.detectedAt;
+    const range = recovery.missingStartMs === null ? "" : ` ${formatEt(recovery.missingStartMs)}–${formatEt((recovery.missingEndMs ?? recovery.missingStartMs) - 60_000)}`;
+    if (recovery.state === "GAP_DETECTED") return `${formatEt(time, true)} ⚠ gap detected${range}`;
+    if (recovery.state === "BACKFILLING") return `${formatEt(time, true)} 🔧 backfill requested SPY/IEX${range}`;
+    if (recovery.state === "VERIFYING") return `${formatEt(time, true)} 🔎 backfill verifying ${recovery.returnedBarCount} bar${recovery.returnedBarCount === 1 ? "" : "s"}`;
+    if (recovery.state === "HEALTHY") return `${formatEt(time, true)} ✅ backfill verified ${recovery.verifiedBarCount} bar${recovery.verifiedBarCount === 1 ? "" : "s"}; 🧠 continuity restored`;
+    return `${formatEt(time, true)} 🟡 recovery rebuilding — ${sanitizeTerminalText(recovery.reason ?? recovery.result ?? "trusted history incomplete")}`;
   }
   const id = sanitizeIdentifier(event.update.clientOrderId);
   return `${formatEt(event.update.receivedAt, true)} 📤 trade update received${id ? ` client=${id}` : ""}`;
@@ -396,6 +448,7 @@ export class ObserverChangeDetector {
   private readonly intents = new BoundedSeen();
   private readonly brokerOrders = new BoundedSeen();
   private readonly tradeUpdates = new BoundedSeen();
+  private readonly recoveries = new BoundedSeen();
 
   observe(snapshot: ObserverSnapshot): ObserverEvent[] {
     const events: ObserverEvent[] = [];
@@ -411,6 +464,7 @@ export class ObserverChangeDetector {
     }
     for (const order of snapshot.brokerOrders) add(this.brokerOrders, order.eventId, { kind: "broker", order });
     for (const update of snapshot.tradeUpdates) add(this.tradeUpdates, update.updateId, { kind: "trade-update", update });
+    if (snapshot.recovery) add(this.recoveries, `${snapshot.recovery.recoveryAttemptId}:${snapshot.recovery.state}:${snapshot.recovery.result ?? ""}`, { kind: "recovery", recovery: snapshot.recovery });
     this.initialized = true;
     return events.sort((left, right) => eventTime(left) - eventTime(right));
   }

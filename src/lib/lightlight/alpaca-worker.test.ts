@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import type { BrokerAccountSnapshot, BrokerOrderState, BrokerPositionSnapshot, OpenBrokerOrder } from "./alpaca.server.ts";
+import type { BrokerAccountSnapshot, BrokerOrderState, BrokerPositionSnapshot, HistoricalStockBars, OpenBrokerOrder } from "./alpaca.server.ts";
 import { ALPACA_PAPER_BASE_URL, type AlpacaConfig } from "./alpaca.server.ts";
 import { ALPACA_WORKER_ASSET, AlpacaPaperWorker, MemoryAlpacaWorkerStore, alpacaPaperWorkerKey, deterministicClientOrderId, deterministicDecisionId, isRegularUsEquitySession } from "./alpaca-worker.server.ts";
 import type { MarketSource } from "./market.ts";
@@ -117,8 +117,29 @@ function rawBars(decisionBuckets = 28): Array<{ t: number; open: number; high: n
   return bars;
 }
 
-function worker(store: MemoryAlpacaWorkerStore, broker: FakeBroker, updates?: FakeTradeUpdates, inSession = true) {
-  return new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, isRegularSession: () => inSession });
+function worker(store: MemoryAlpacaWorkerStore, broker: FakeBroker, updates?: FakeTradeUpdates, inSession = true, historicalBars?: HistoricalStockBars, now?: () => Date) {
+  return new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, historicalBars, now, isRegularSession: () => inSession });
+}
+
+class FakeHistoricalBars implements HistoricalStockBars {
+  requests: Array<{ symbol: "SPY"; start: number; end: number }> = [];
+  private readonly response: (start: number, end: number) => Array<{ t: number; open: number; high: number; low: number; close: number; volume: number }>;
+  constructor(response: (start: number, end: number) => Array<{ t: number; open: number; high: number; low: number; close: number; volume: number }>) { this.response = response; }
+  async bars(request: { symbol: "SPY"; start: number; end: number }) {
+    this.requests.push(request);
+    return this.response(request.start, request.end);
+  }
+}
+
+class ConflictingHistoricalRecoveryStore extends MemoryAlpacaWorkerStore {
+  override async recordMarketBar(observation: Parameters<MemoryAlpacaWorkerStore["recordMarketBar"]>[0]) {
+    if (observation.origin === "REST_BACKFILL") return "CONFLICT" as const;
+    return super.recordMarketBar(observation);
+  }
+}
+
+async function persistDurableBars(store: MemoryAlpacaWorkerStore, bars: Array<{ t: number; open: number; high: number; low: number; close: number; volume: number }>): Promise<void> {
+  for (const bar of bars) await store.insertClosedBar("SPY", bar);
 }
 
 class ManualMarketSource implements MarketSource {
@@ -413,28 +434,141 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     assert.equal(legacy.snapshot().workerState, "HALTED", "legacy checkpoint cannot silently reset paper-equity high-water");
   });
 
-  it("invalidates feature continuity after a missing bucket and resumes only after fresh warmup", async () => {
-    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
+  it("repairs an exact 1m gap with REST provenance without retroactive dispatch", async () => {
+    const bars = rawBars(30); const missing = bars[24 * 15 + 4]!;
+    const historical = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker();
+    const target = worker(store, broker, undefined, true, historical, () => new Date(missing.t + 2 * 60_000));
     await target.start();
-    const bars = rawBars(60);
-    const start = bars[0]!.t;
-    const missingBucketStart = start + 2 * 15 * 60_000;
-    for (const bar of bars.filter((bar) => bar.t < missingBucketStart || bar.t >= missingBucketStart + 15 * 60_000)) await target.processRawBar(bar);
-    assert.ok(target.snapshot().missingDecisionBuckets > 0);
-    assert.equal(target.snapshot().featureContinuity, "HEALTHY", "enough post-gap continuous bars rebuild warmup");
-    const firstAfterGap = store.decisionEvidence().find((evidence) => evidence.timestamp === missingBucketStart + 15 * 60_000);
-    assert.equal(firstAfterGap?.features.logReturn, 0, "the first post-gap return never bridges to pre-gap close");
-    assert.equal(firstAfterGap?.barIndex, 0, "post-gap feature indexing restarts rather than inheriting pre-gap history");
+    for (const bar of bars.filter((bar) => bar.t < missing.t)) await target.processRawBar(bar);
+    const postsBeforeRepair = broker.posts;
+    for (const bar of bars.filter((bar) => bar.t > missing.t && bar.t <= missing.t + 60_000)) await target.processRawBar(bar);
+    assert.deepEqual(historical.requests, [{ symbol: "SPY", start: missing.t, end: missing.t + 60_000 }]);
+    assert.equal(target.snapshot().recoveryState, "HEALTHY");
+    assert.equal(target.snapshot().featureContinuity, "HEALTHY");
+    assert.equal(broker.posts, postsBeforeRepair, "the repaired historical bucket cannot dispatch");
+    const observation = store.marketObservations().find((item) => item.origin === "REST_BACKFILL");
+    assert.equal(observation?.verificationResult, "ACCEPTED");
+    assert.equal(observation?.bar.t, missing.t);
+    assert.equal(observation?.providerEventTimestampMs, missing.t);
+    assert.equal(observation?.observedAt, new Date(missing.t + 2 * 60_000).toISOString());
+    assert.ok(observation?.recoveryAttemptId);
+    assert.equal(store.recoveryAttempt(observation!.recoveryAttemptId!)?.result, "VERIFIED");
 
-    const rebuildingStore = new MemoryAlpacaWorkerStore(); const rebuildingBroker = new FakeBroker(); const rebuilding = worker(rebuildingStore, rebuildingBroker);
-    await rebuilding.start();
-    const shortBars = rawBars(20).filter((bar) => bar.t < missingBucketStart || bar.t >= missingBucketStart + 15 * 60_000);
-    for (const bar of shortBars) await rebuilding.processRawBar(bar);
-    assert.equal(rebuilding.snapshot().featureContinuity, "REBUILDING"); assert.equal(rebuildingBroker.posts, 0, "dispatch remains blocked while warmup rebuilds");
-    await rebuilding.stop();
-    const resumed = worker(rebuildingStore, rebuildingBroker); await resumed.start();
-    for (const bar of bars.filter((bar) => bar.t > shortBars.at(-1)!.t && (bar.t < missingBucketStart || bar.t >= missingBucketStart + 15 * 60_000))) await resumed.processRawBar(bar);
-    assert.equal(resumed.snapshot().featureContinuity, "HEALTHY"); assert.ok(rebuildingBroker.posts > 0, "only post-gap warmup can restore dispatch");
+    for (const bar of bars.filter((bar) => bar.t > missing.t + 60_000)) await target.processRawBar(bar);
+    assert.ok(broker.posts > postsBeforeRepair, "a subsequent live bucket may use repaired history");
+  });
+
+  it("repairs one durable restart gap, restores continuity, and defers dispatch until a future live bucket", async () => {
+    const bars = rawBars(24); const durableLatest = bars.at(-1)!; const missing = bars[10 * 15 + 4]!;
+    const store = new MemoryAlpacaWorkerStore();
+    await persistDurableBars(store, bars.filter((bar) => bar.t !== missing.t));
+    const broker = new FakeBroker();
+    const historical = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const now = () => new Date(durableLatest.t + 2 * 60_000);
+    const restarted = worker(store, broker, undefined, true, historical, now);
+
+    await restarted.start();
+
+    assert.deepEqual(historical.requests, [{ symbol: "SPY", start: missing.t, end: missing.t + 60_000 }]);
+    assert.equal(restarted.snapshot().featureContinuity, "HEALTHY");
+    assert.equal(restarted.snapshot().recoveryState, "HEALTHY");
+    assert.equal(broker.posts, 0, "startup repair never creates a retroactive broker POST");
+    assert.equal(store.decisionCount(), 0, "startup repair never creates retroactive decisions");
+    const repaired = store.marketObservations().find((observation) => observation.origin === "REST_BACKFILL");
+    assert.equal(repaired?.bar.t, missing.t);
+    assert.equal(repaired?.verificationResult, "ACCEPTED");
+
+    const nextDispatchBarrier = durableLatest.t + 15 * 60_000;
+    for (const bar of rawBars(26).filter((bar) => bar.t > durableLatest.t && bar.t < durableLatest.t + 30 * 60_000)) await restarted.processRawBar(bar);
+    assert.ok(broker.posts > 0, "a future live bucket may dispatch after verification completes");
+    assert.ok(store.decisionEvidence().every((evidence) => evidence.timestamp >= nextDispatchBarrier), "only a future live bucket becomes dispatch-eligible");
+  });
+
+  it("repairs separated durable restart gaps oldest-first", async () => {
+    const bars = rawBars(24); const first = bars[10 * 15 + 4]!; const second = bars[13 * 15 + 7]!;
+    const firstEnd = first.t + 2 * 60_000; const secondEnd = second.t + 3 * 60_000;
+    const store = new MemoryAlpacaWorkerStore();
+    await persistDurableBars(store, bars.filter((bar) =>
+      (bar.t < first.t || bar.t >= firstEnd) && (bar.t < second.t || bar.t >= secondEnd)));
+    const historical = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const target = worker(store, new FakeBroker(), undefined, true, historical, () => new Date(bars.at(-1)!.t + 2 * 60_000));
+
+    await target.start();
+
+    assert.deepEqual(historical.requests, [
+      { symbol: "SPY", start: first.t, end: firstEnd },
+      { symbol: "SPY", start: second.t, end: secondEnd },
+    ]);
+    assert.equal(target.snapshot().featureContinuity, "HEALTHY");
+    assert.equal(target.snapshot().recoveryState, "HEALTHY");
+  });
+
+  it("keeps startup recovery fail-closed for partial, conflicting, and unavailable history", async () => {
+    const bars = rawBars(24); const first = bars[22 * 15 + 4]!; const second = bars[22 * 15 + 5]!;
+    const partialStore = new MemoryAlpacaWorkerStore();
+    await persistDurableBars(partialStore, bars.filter((bar) => bar.t !== first.t && bar.t !== second.t));
+    const partial = new FakeHistoricalBars((start) => [bars.find((bar) => bar.t === start)!]);
+    const partialBroker = new FakeBroker();
+    const partialWorker = worker(partialStore, partialBroker, undefined, true, partial, () => new Date(bars.at(-1)!.t + 2 * 60_000));
+    await partialWorker.start();
+    assert.equal(partialWorker.snapshot().recoveryState, "REBUILDING");
+    assert.equal(partialWorker.snapshot().featureContinuity, "REBUILDING");
+    assert.equal(partialBroker.posts, 0);
+
+    const conflictStore = new ConflictingHistoricalRecoveryStore();
+    await persistDurableBars(conflictStore, bars.filter((bar) => bar.t !== first.t));
+    const conflictBroker = new FakeBroker();
+    const conflict = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const conflictWorker = worker(conflictStore, conflictBroker, undefined, true, conflict, () => new Date(bars.at(-1)!.t + 2 * 60_000));
+    await conflictWorker.start();
+    assert.equal(conflictWorker.snapshot().recoveryState, "REBUILDING");
+    assert.equal(conflictWorker.snapshot().featureContinuity, "REBUILDING");
+    assert.equal(conflictBroker.posts, 0);
+
+    const unavailableStore = new MemoryAlpacaWorkerStore();
+    await persistDurableBars(unavailableStore, bars.filter((bar) => bar.t !== first.t));
+    const unavailable = new FakeHistoricalBars(() => { throw new Error("HISTORICAL_UNAVAILABLE"); });
+    const unavailableWorker = worker(unavailableStore, new FakeBroker(), undefined, true, unavailable, () => new Date(bars.at(-1)!.t + 2 * 60_000));
+    await unavailableWorker.start();
+    assert.equal(unavailableWorker.snapshot().recoveryState, "REBUILDING");
+    assert.equal(unavailableWorker.snapshot().featureContinuity, "REBUILDING");
+  });
+
+  it("keeps dispatch blocked for partial multi-minute backfill and fails closed on conflicts", async () => {
+    const bars = rawBars(30); const first = bars[24 * 15 + 4]!; const second = bars[24 * 15 + 5]!;
+    const partial = new FakeHistoricalBars((start) => [bars.find((bar) => bar.t === start)!]);
+    const partialStore = new MemoryAlpacaWorkerStore(); const partialBroker = new FakeBroker();
+    const partialWorker = worker(partialStore, partialBroker, undefined, true, partial, () => new Date(first.t + 2 * 60_000));
+    await partialWorker.start();
+    for (const bar of bars.filter((bar) => bar.t < first.t)) await partialWorker.processRawBar(bar);
+    const partialPostsBeforeGap = partialBroker.posts;
+    for (const bar of bars.filter((bar) => bar.t > second.t && bar.t <= second.t + 60_000)) await partialWorker.processRawBar(bar);
+    assert.equal(partialWorker.snapshot().recoveryState, "REBUILDING");
+    assert.equal(partialBroker.posts, partialPostsBeforeGap, "partial backfill is never dispatch authority");
+    assert.equal(partial.requests[0]!.end - partial.requests[0]!.start, 2 * 60_000);
+
+    const conflictStore = new MemoryAlpacaWorkerStore();
+    const conflictBroker = new FakeBroker();
+    const conflict = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const conflictWorker = worker(conflictStore, conflictBroker, undefined, true, conflict, () => new Date(first.t + 2 * 60_000));
+    await conflictWorker.start();
+    for (const bar of bars.filter((bar) => bar.t < first.t)) await conflictWorker.processRawBar(bar);
+    await conflictStore.insertClosedBar("SPY", { ...first, close: first.close + 9 });
+    const conflictPostsBeforeGap = conflictBroker.posts;
+    for (const bar of bars.filter((bar) => bar.t > first.t && bar.t <= first.t + 60_000)) await conflictWorker.processRawBar(bar);
+    assert.equal(conflictWorker.snapshot().recoveryState, "REBUILDING");
+    const conflictObservation = conflictStore.marketObservations().find((item) => item.origin === "REST_BACKFILL");
+    assert.equal(conflictObservation?.verificationResult, "CONFLICT");
+    assert.equal(conflictBroker.posts, conflictPostsBeforeGap);
+  });
+
+  it("keeps identical LIVE_WS and REST_BACKFILL observations idempotent", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const bar = rawBars(1)[0]!;
+    assert.equal(await store.recordMarketBar({ symbol: "SPY", bar, providerEventTimestampMs: bar.t, observedAt: "2026-09-21T13:31:00.000Z", origin: "LIVE_WS", recoveryAttemptId: null }), "ACCEPTED");
+    assert.equal(await store.recordMarketBar({ symbol: "SPY", bar, providerEventTimestampMs: bar.t, observedAt: "2026-09-21T13:32:00.000Z", origin: "REST_BACKFILL", recoveryAttemptId: "attempt-1" }), "IDENTICAL");
+    assert.equal((await store.listClosedBars("SPY")).length, 1);
+    assert.equal(store.marketObservations().filter((item) => item.bar.t === bar.t).length, 2);
   });
 
   it("reconciles then reconnects one market consumer, cancels backoff on stop, and halts on reconciliation failure", async () => {
