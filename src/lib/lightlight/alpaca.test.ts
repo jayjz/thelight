@@ -10,6 +10,7 @@ import {
   brokerStateFromTradeUpdate,
   closedBarFromAlpaca,
   loadAlpacaConfig,
+  loadLocalMarketDataUrl,
   websocketPayloadToText,
 } from "./alpaca.server.ts";
 import type { ExecutionIntent } from "./types.ts";
@@ -80,6 +81,49 @@ describe("Alpaca paper boundaries", () => {
       { action: "auth", key: "key", secret: "secret" },
       { action: "subscribe", bars: ["SPY"] },
     ]);
+  });
+
+  it("uses the fixed local relay without sending data credentials and preserves a completed SPY bar", async () => {
+    const config = loadAlpacaConfig(env);
+    const directSocket = new FakeWebSocket();
+    const localSocket = new FakeWebSocket();
+    const now = Date.parse("2026-01-01T00:01:00Z");
+    const direct = new AlpacaMarketSource(config, () => directSocket, () => now).bars()[Symbol.asyncIterator]();
+    const local = new AlpacaMarketSource(
+      config,
+      () => localSocket,
+      () => now,
+      "ws://127.0.0.1:8765",
+    ).bars()[Symbol.asyncIterator]();
+    const directNext = direct.next();
+    const localNext = local.next();
+    const bar = { T: "b", S: "SPY", o: 1, h: 2, l: 0.5, c: 1.5, v: 10, t: "2026-01-01T00:00:00Z" };
+
+    await directSocket.message(JSON.stringify([{ T: "success", msg: "connected" }]));
+    await directSocket.message(JSON.stringify([{ T: "success", msg: "authenticated" }]));
+    await directSocket.message(JSON.stringify([bar]));
+    await localSocket.open();
+    await localSocket.message(JSON.stringify([{ T: "subscription", bars: ["SPY"], quotes: [] }]));
+    await localSocket.message(JSON.stringify([bar]));
+
+    assert.deepEqual((await directNext).value, await localNext.then((result) => result.value));
+    assert.deepEqual(localSocket.sent.map((payload) => JSON.parse(payload)), [{ action: "subscribe", bars: ["SPY"] }]);
+    assert.ok(!JSON.stringify(localSocket.sent).includes(config.apiSecretKey));
+    await direct.return?.();
+    await local.return?.();
+  });
+
+  it("allows only the fixed localhost relay origin", () => {
+    assert.equal(loadLocalMarketDataUrl({}), null);
+    assert.equal(loadLocalMarketDataUrl({ ALPACA_LOCAL_FEED_URL: "ws://127.0.0.1:8765" }), "ws://127.0.0.1:8765");
+    assert.throws(
+      () => loadLocalMarketDataUrl({ ALPACA_LOCAL_FEED_URL: "ws://example.invalid:8765" }),
+      /fixed localhost market-data relay/,
+    );
+    assert.throws(
+      () => new AlpacaMarketSource(loadAlpacaConfig(env), undefined, undefined, "ws://example.invalid:8765"),
+      /fixed localhost relay/,
+    );
   });
 
   it("accepts only a completed 1Min market-data bar", () => {

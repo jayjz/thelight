@@ -6,6 +6,7 @@ export const ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 export const ALPACA_DATA_BASE_URL = "https://data.alpaca.markets";
 export const ALPACA_IEX_STREAM_URL = "wss://stream.data.alpaca.markets/v2/iex";
 export const ALPACA_PAPER_TRADE_STREAM_URL = "wss://paper-api.alpaca.markets/stream";
+const LOCAL_RELAY_ORIGINS = new Set(["ws://127.0.0.1:8765", "ws://localhost:8765"]);
 
 export type AlpacaConfig = {
   apiKeyId: string;
@@ -82,6 +83,22 @@ export function loadAlpacaConfig(env: NodeJS.ProcessEnv = process.env): AlpacaCo
   };
 }
 
+/**
+ * Opt-in, fixed-origin local market-data transport.  It has no bearing on
+ * PAPER account, order, or trade-update connections, which remain hard-bound.
+ */
+export function loadLocalMarketDataUrl(env: NodeJS.ProcessEnv = process.env): string | null {
+  const value = env.ALPACA_LOCAL_FEED_URL?.trim();
+  if (!value) return null;
+  if (!LOCAL_RELAY_ORIGINS.has(value)) {
+    throw new AlpacaConfigurationError(
+      "INVALID_PAPER_DOMAIN",
+      "ALPACA_LOCAL_FEED_URL must be the fixed localhost market-data relay.",
+    );
+  }
+  return value;
+}
+
 export function alpacaHeaders(config: AlpacaConfig): HeadersInit {
   return {
     "APCA-API-KEY-ID": config.apiKeyId,
@@ -145,16 +162,28 @@ export class AlpacaMarketSource implements MarketSource {
     config: AlpacaConfig,
     createSocket: WebSocketFactory = (url) => new WebSocket(url),
     now: () => number = Date.now,
+    localFeedUrl: string | null = loadLocalMarketDataUrl(),
   ) {
+    if (localFeedUrl && !LOCAL_RELAY_ORIGINS.has(localFeedUrl)) {
+      throw new AlpacaConfigurationError(
+        "INVALID_PAPER_DOMAIN",
+        "Local market-data transport must be the fixed localhost relay.",
+      );
+    }
     this.config = config;
     this.createSocket = createSocket;
     this.now = now;
-    this.id = `alpaca:${config.dataFeed}:${config.symbol}:1Min`;
+    this.id = localFeedUrl
+      ? `alpaca-local-relay:${config.dataFeed}:${config.symbol}:1Min`
+      : `alpaca:${config.dataFeed}:${config.symbol}:1Min`;
+    this.localFeedUrl = localFeedUrl;
   }
+
+  private readonly localFeedUrl: string | null;
 
   async *bars(): AsyncIterable<ClosedBar> {
     const feed = this.config.dataFeed;
-    const streamUrl = `wss://stream.data.alpaca.markets/v2/${feed}`;
+    const streamUrl = this.localFeedUrl ?? `wss://stream.data.alpaca.markets/v2/${feed}`;
     const socket = this.createSocket(streamUrl);
     const queue: ClosedBar[] = [];
     let failure: Error | undefined;
@@ -170,10 +199,12 @@ export class AlpacaMarketSource implements MarketSource {
         try {
           const messages = JSON.parse(await websocketPayloadToText(event.data)) as Array<Record<string, unknown>>;
           for (const message of messages) {
-            if (message.T === "success" && message.msg === "connected") {
+            if (!this.localFeedUrl && message.T === "success" && message.msg === "connected") {
               socket.send(JSON.stringify({ action: "auth", key: this.config.apiKeyId, secret: this.config.apiSecretKey }));
-            } else if (message.T === "success" && message.msg === "authenticated") {
+            } else if (!this.localFeedUrl && message.T === "success" && message.msg === "authenticated") {
               socket.send(JSON.stringify({ action: "subscribe", bars: [this.config.symbol] }));
+            } else if (this.localFeedUrl && message.T === "relay") {
+              failure = new AlpacaTransportError("DISCONNECTED_STREAM", "Local market-data relay is unavailable.");
             } else if (message.T === "error") {
               failure = new AlpacaTransportError(
                 Number(message.code) === 402 ? "AUTHENTICATION_FAILURE" : "UNSUPPORTED_DATA_FEED",
@@ -198,6 +229,11 @@ export class AlpacaMarketSource implements MarketSource {
     socket.addEventListener("close", () => {
       failure ??= new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca data stream closed.");
       signal();
+    });
+    socket.addEventListener("open", () => {
+      if (this.localFeedUrl) {
+        socket.send(JSON.stringify({ action: "subscribe", bars: [this.config.symbol] }));
+      }
     });
     try {
       for (;;) {
