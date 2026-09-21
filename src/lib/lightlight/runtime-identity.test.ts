@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { BTC_USD_SPEC, SPY_SPEC } from "./assets.ts";
+import { BTC_USD_SPEC, BOUNDED_US_EQUITY_ASSETS, SPY_SPEC } from "./assets.ts";
 import { DurableMarketWorker } from "./durable-market-worker.server.ts";
 import { deterministicClientOrderId, deterministicDecisionId } from "./alpaca-worker.server.ts";
 import { MemoryAlpacaWorkerStore } from "./alpaca-worker-store.server.ts";
@@ -29,6 +29,13 @@ describe("asset-scoped durable runtime identity", () => {
     assert.equal(first.asset, BTC_USD_SPEC);
     assert.equal(first.capability.kind, "READ_ONLY_DURABLE");
     assert.equal(workerRuntimeIdentityFor(SPY_SPEC).capability.kind, "DISPATCH_CAPABLE");
+  });
+
+  it("isolates every ema_rsi_v1 equity runtime and grants PAPER dispatch only to SPY", () => {
+    const identities = BOUNDED_US_EQUITY_ASSETS.map((asset) => workerRuntimeIdentityFor(asset, "ema_rsi_v1"));
+    assert.equal(new Set(identities.map((identity) => identity.workerKey)).size, 5);
+    assert.deepEqual(identities.map((identity) => identity.capability.kind), ["DISPATCH_CAPABLE", "READ_ONLY_DURABLE", "READ_ONLY_DURABLE", "READ_ONLY_DURABLE", "READ_ONLY_DURABLE"]);
+    assert.notEqual(deterministicDecisionId(1_726_000_000_000, identities[0]!), deterministicDecisionId(1_726_000_000_000, identities[1]!));
   });
 
   it("makes deterministic decision, intent, and client-order identities asset-safe", () => {

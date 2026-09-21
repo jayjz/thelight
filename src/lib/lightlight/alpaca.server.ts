@@ -1,6 +1,6 @@
 import type { ClosedBar, ExecutionIntent, ExecutionStatus } from "./types.ts";
 import type { MarketSource } from "./market.ts";
-import { SPY_SPEC, alpacaEquityFeedFor } from "./assets.ts";
+import { SPY_SPEC, alpacaEquityFeedFor, isBoundedEquitySymbol, type BoundedEquitySymbol } from "./assets.ts";
 
 export const ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 export const ALPACA_DATA_BASE_URL = "https://data.alpaca.markets";
@@ -14,7 +14,7 @@ export type AlpacaConfig = {
   paperBaseUrl: typeof ALPACA_PAPER_BASE_URL;
   dataBaseUrl: typeof ALPACA_DATA_BASE_URL;
   dataFeed: "iex" | "sip" | "delayed_sip";
-  symbol: string;
+  symbol: BoundedEquitySymbol;
 };
 
 export class AlpacaConfigurationError extends Error {
@@ -75,13 +75,15 @@ export function loadAlpacaConfig(env: NodeJS.ProcessEnv = process.env): AlpacaCo
   if (dataFeed !== "iex" && dataFeed !== "sip" && dataFeed !== "delayed_sip") {
     throw new AlpacaConfigurationError("UNSUPPORTED_DATA_FEED", `Unsupported Alpaca feed: ${dataFeed}.`);
   }
+  const symbol = (env.ALPACA_SYMBOL?.trim().toUpperCase() || SPY_SPEC.symbol);
+  if (!isBoundedEquitySymbol(symbol)) throw new AlpacaConfigurationError("INVALID_PAPER_DOMAIN", "ALPACA_SYMBOL must be in the configured bounded equity universe.");
   return {
     apiKeyId: requiredEnv(env, "ALPACA_API_KEY_ID"),
     apiSecretKey: requiredEnv(env, "ALPACA_API_SECRET_KEY"),
     paperBaseUrl: ALPACA_PAPER_BASE_URL,
     dataBaseUrl: ALPACA_DATA_BASE_URL,
     dataFeed,
-    symbol: env.ALPACA_SYMBOL?.trim().toUpperCase() || SPY_SPEC.symbol,
+    symbol,
   };
 }
 
@@ -121,7 +123,7 @@ export type AlpacaStockBarMessage = {
 
 /** Read-only, bounded historical market-data boundary. It has no broker API. */
 export interface HistoricalStockBars {
-  bars(request: { symbol: "SPY"; start: number; end: number }): Promise<ClosedBar[]>;
+  bars(request: { symbol: BoundedEquitySymbol; start: number; end: number }): Promise<ClosedBar[]>;
 }
 
 function strictHistoricalBar(value: unknown, start: number, end: number): ClosedBar {
@@ -137,7 +139,7 @@ function strictHistoricalBar(value: unknown, start: number, end: number): Closed
 
 /**
  * Deliberately separate from AlpacaPaperBroker: this client can only retrieve
- * fixed SPY/IEX 1-minute bars for a caller-provided bounded interval.
+ * bounded configured IEX 1-minute bars for a caller-provided bounded interval.
  */
 export class AlpacaHistoricalStockBars implements HistoricalStockBars {
   private readonly config: AlpacaConfig;
@@ -146,17 +148,17 @@ export class AlpacaHistoricalStockBars implements HistoricalStockBars {
   constructor(config: AlpacaConfig, request: typeof fetch = fetch) {
     this.config = config;
     this.request = request;
-    if (config.dataBaseUrl !== ALPACA_DATA_BASE_URL || config.symbol !== "SPY") throw new Error("ALPACA_HISTORICAL_SCOPE_FORBIDDEN");
+    if (config.dataBaseUrl !== ALPACA_DATA_BASE_URL || !isBoundedEquitySymbol(config.symbol)) throw new Error("ALPACA_HISTORICAL_SCOPE_FORBIDDEN");
   }
 
-  async bars({ symbol, start, end }: { symbol: "SPY"; start: number; end: number }): Promise<ClosedBar[]> {
-    if (symbol !== "SPY" || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= end || start % 60_000 !== 0 || end % 60_000 !== 0) {
+  async bars({ symbol, start, end }: { symbol: BoundedEquitySymbol; start: number; end: number }): Promise<ClosedBar[]> {
+    if (!isBoundedEquitySymbol(symbol) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= end || start % 60_000 !== 0 || end % 60_000 !== 0) {
       throw new Error("INVALID_HISTORICAL_BAR_RANGE");
     }
     const expected = (end - start) / 60_000;
     if (expected > 390) throw new Error("HISTORICAL_BAR_RANGE_UNBOUNDED");
     const url = new URL("/v2/stocks/bars", ALPACA_DATA_BASE_URL);
-    url.searchParams.set("symbols", "SPY");
+    url.searchParams.set("symbols", symbol);
     url.searchParams.set("timeframe", "1Min");
     url.searchParams.set("feed", "iex");
     url.searchParams.set("start", new Date(start).toISOString());
@@ -180,7 +182,7 @@ export class AlpacaHistoricalStockBars implements HistoricalStockBars {
     } catch {
       throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was malformed.");
     }
-    const values = body && typeof body === "object" && !Array.isArray(body) ? body.bars?.SPY : undefined;
+    const values = body && typeof body === "object" && !Array.isArray(body) ? body.bars?.[symbol] : undefined;
     if (!Array.isArray(values)) throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was malformed.");
     const bars = values.map((value) => strictHistoricalBar(value, start, end));
     const timestamps = new Set(bars.map((bar) => bar.t));
@@ -288,6 +290,9 @@ export class AlpacaMarketSource implements MarketSource {
                 String(message.msg ?? "Alpaca data-stream error."),
               );
             } else {
+              // A relay may carry the bounded union; this consumer accepts only
+              // its runtime asset, so one symbol can never enter another's state.
+              if (String(message.S ?? "").toUpperCase() !== this.config.symbol) continue;
               const bar = closedBarFromAlpaca(message as unknown as AlpacaStockBarMessage, this.now());
               if (bar) queue.push(bar);
             }

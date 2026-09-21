@@ -5,7 +5,9 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { BrokerAccountSnapshot, BrokerOrderState, BrokerPositionSnapshot, HistoricalStockBars, OpenBrokerOrder } from "./alpaca.server.ts";
 import { ALPACA_PAPER_BASE_URL, AlpacaTransportError, type AlpacaConfig } from "./alpaca.server.ts";
-import { ALPACA_WORKER_ASSET, AlpacaPaperWorker, MemoryAlpacaWorkerStore, alpacaPaperWorkerKey, deterministicClientOrderId, deterministicDecisionId, isRegularUsEquitySession } from "./alpaca-worker.server.ts";
+import { ALPACA_WORKER_ASSET, AlpacaPaperWorker, MemoryAlpacaWorkerStore, alpacaPaperWorkerKey, deterministicClientOrderId, deterministicDecisionId, dispatchBlockReasonFor, isRegularUsEquitySession } from "./alpaca-worker.server.ts";
+import { BOUNDED_US_EQUITY_ASSETS, SPY_SPEC } from "./assets.ts";
+import { workerRuntimeIdentityFor } from "./runtime-identity.ts";
 import type { MarketSource } from "./market.ts";
 import type { ExecutionIntent } from "./types.ts";
 
@@ -117,8 +119,10 @@ function rawBars(decisionBuckets = 28): Array<{ t: number; open: number; high: n
   return bars;
 }
 
+const fixtureNow = () => new Date(rawBars().at(-1)!.t + 60_000);
+
 function worker(store: MemoryAlpacaWorkerStore, broker: FakeBroker, updates?: FakeTradeUpdates, inSession = true, historicalBars?: HistoricalStockBars, now?: () => Date) {
-  return new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, historicalBars, now, isRegularSession: () => inSession });
+  return new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, historicalBars, now: now ?? fixtureNow, isRegularSession: () => inSession });
 }
 
 class FakeHistoricalBars implements HistoricalStockBars {
@@ -158,13 +162,68 @@ class ManualMarketSource implements MarketSource {
 
 const flush = async () => new Promise<void>((resolve) => setImmediate(resolve));
 
+async function processLiveBars(target: AlpacaPaperWorker, bars = rawBars()): Promise<void> {
+  const fixture = target as unknown as { options: { now?: () => Date } };
+  for (const bar of bars) {
+    fixture.options.now = () => new Date(bar.t + 60_000);
+    await target.processRawBar(bar);
+  }
+}
+
 async function runToDispatch(target: AlpacaPaperWorker, broker: FakeBroker) {
   await target.start();
-  for (const bar of rawBars()) await target.processRawBar(bar);
+  await processLiveBars(target);
   assert.ok(broker.posts > 0, "fixture must produce at least one Arm C paper dispatch after warmup");
 }
 
 describe("Alpaca PAPER worker restart and authority invariants", () => {
+  it("applies stale-bar, reconciliation, and ownership gates to both SPY dispatch arms", () => {
+    const healthy = {
+      dispatchCapable: true,
+      inSession: true,
+      warmupComplete: true,
+      featureContinuity: "HEALTHY" as const,
+      recoveryState: "HEALTHY" as const,
+      latestLiveBarStale: false,
+      reconciliationComplete: true,
+      hasOwnership: true,
+    };
+    for (const arm of ["ema_trend_arm_c", "ema_rsi_v1"] as const) {
+      const identity = workerRuntimeIdentityFor(SPY_SPEC, arm);
+      assert.equal(identity.capability.kind, "DISPATCH_CAPABLE");
+      assert.equal(dispatchBlockReasonFor({ ...healthy, latestLiveBarStale: true }), "LATEST_LIVE_BAR_STALE", `${arm} stale live bar`);
+      assert.equal(dispatchBlockReasonFor({ ...healthy, reconciliationComplete: false }), "BROKER_RECONCILIATION_INCOMPLETE", `${arm} reconciliation`);
+      assert.equal(dispatchBlockReasonFor({ ...healthy, hasOwnership: false }), "DISPATCH_OWNERSHIP_REQUIRED", `${arm} ownership`);
+      assert.equal(dispatchBlockReasonFor(healthy), null, `${arm} healthy dispatch`);
+    }
+  });
+
+  it("keeps read-only durable symbols evidence-only without broker reconciliation, trade updates, or POSTs", async () => {
+    const readOnlyAssets = BOUNDED_US_EQUITY_ASSETS.filter((asset) => asset.symbol !== "SPY");
+    for (const arm of ["ema_trend_arm_c", "ema_rsi_v1"] as const) {
+      for (const asset of readOnlyAssets) {
+        const store = new MemoryAlpacaWorkerStore();
+        const broker = new FakeBroker();
+        const updates = new FakeTradeUpdates();
+        const target = new AlpacaPaperWorker({
+          config: { ...config, symbol: asset.symbol }, asset, arm, store, broker, tradeUpdates: updates,
+          isRegularSession: () => true,
+          now: () => new Date(rawBars(45).at(-1)!.t + 60_000),
+        });
+        await target.start();
+        for (const bar of rawBars(45)) await target.processRawBar(bar);
+        assert.equal(target.snapshot().runtimeCapability, "READ_ONLY_DURABLE", `${asset.symbol} ${arm}`);
+        assert.ok(store.decisionCount() > 0, `${asset.symbol} ${arm} produces research evidence`);
+        assert.equal(broker.accountCalls, 0, `${asset.symbol} ${arm} never reconciles broker account`);
+        assert.equal(broker.positionCalls, 0, `${asset.symbol} ${arm} never reconciles broker position`);
+        assert.equal(updates.connects, 0, `${asset.symbol} ${arm} never connects trade_updates`);
+        assert.equal(broker.posts, 0, `${asset.symbol} ${arm} cannot broker POST`);
+        assert.ok((await store.listIntents(asset.symbol, target.snapshot().workerKey)).every((row) => row.dispatchBlockReason === "READ_ONLY_RUNTIME"));
+        await target.stop();
+      }
+    }
+  });
+
   it("deduplicates raw bars and completed decision bars", async () => {
     const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
     await target.start();
@@ -253,7 +312,7 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
 
     const unavailableStore = new MemoryAlpacaWorkerStore(); const unavailableBroker = new FakeBroker();
     const unavailable = worker(unavailableStore, unavailableBroker); await unavailable.start(); unavailableBroker.throwPosition = true;
-    for (const bar of rawBars()) await unavailable.processRawBar(bar);
+    await processLiveBars(unavailable);
     assert.equal(unavailable.snapshot().workerState, "HALTED"); assert.equal(unavailableBroker.posts, 0);
 
     const wrongSymbolStore = new MemoryAlpacaWorkerStore(); const wrongSymbolBroker = new FakeBroker(); wrongSymbolBroker.positionSymbol = "QQQ";
@@ -262,14 +321,14 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
 
     const conflictStore = new MemoryAlpacaWorkerStore(); const conflictBroker = new FakeBroker(); conflictBroker.openOnDispatch = true;
     const conflictWorker = worker(conflictStore, conflictBroker); await conflictWorker.start();
-    for (const bar of rawBars()) await conflictWorker.processRawBar(bar);
+    await processLiveBars(conflictWorker);
     assert.equal(conflictBroker.posts, 0);
     assert.ok((await conflictStore.listIntents()).some((row) => row.dispatchBlockReason === "OPEN_ORDER_CONFLICT"));
   });
 
   it("persists trade updates, reconciles after stream loss, and never dispatches outside the exchange session", async () => {
     const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const updates = new FakeTradeUpdates();
-    const target = new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, isRegularSession: () => true, sleep: async () => undefined });
+    const target = new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, isRegularSession: () => true, now: fixtureNow, sleep: async () => undefined });
     await runToDispatch(target, broker);
     const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
     await target.processTradeUpdate({ stream: "trade_updates", data: { event: "fill", order: { id: "broker-1", status: "filled", client_order_id: accepted.clientOrderId } } });
@@ -291,7 +350,7 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     const target = new AlpacaPaperWorker({
       config, store, broker, tradeUpdates: updates, isRegularSession: () => true,
       reconnectDelayMs: (attempt) => attempt * 10,
-      sleep: (delay) => new Promise<void>((resolve) => { backoffs.push({ delay, resolve }); }),
+      now: fixtureNow, sleep: (delay) => new Promise<void>((resolve) => { backoffs.push({ delay, resolve }); }),
     });
     await runToDispatch(target, broker);
     const decisions = store.decisionCount(); const posts = broker.posts;

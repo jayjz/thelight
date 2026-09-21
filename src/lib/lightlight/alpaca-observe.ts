@@ -1,3 +1,6 @@
+import { boundedEquityAsset } from "./assets.ts";
+import { workerRuntimeIdentityFor } from "./runtime-identity.ts";
+
 /**
  * Read-only projection and terminal formatting for the durable Alpaca PAPER
  * evidence. This module intentionally has no dependency on worker, broker, or
@@ -7,6 +10,11 @@
 export const DEFAULT_ALPACA_PAPER_WORKER_KEY = "alpaca-paper:SPY:15Min:alpaca-paper-worker-v1";
 export const EMA_RSI_V1_ALPACA_PAPER_WORKER_KEY = "alpaca-paper:SPY:1Min:ema-rsi-v1-paper-worker-v1";
 export const DEFAULT_OBSERVER_SYMBOL = "SPY";
+
+/** Resolves observer scopes through the same bounded runtime identity contract. */
+export function observerWorkerKeyFor(symbol: string, arm: "ema_trend_arm_c" | "ema_rsi_v1" = "ema_trend_arm_c"): string {
+  return workerRuntimeIdentityFor(boundedEquityAsset(symbol), arm).workerKey;
+}
 
 export type ObserverQuery = {
   query<T extends Record<string, unknown>>(text: string, values?: unknown[]): Promise<{ rows: T[] }>;
