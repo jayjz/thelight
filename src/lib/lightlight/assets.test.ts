@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   BTC_USD_SPEC,
+  BOUNDED_US_EQUITY_ASSETS,
   SPY_SPEC,
   applyDirectionalCapability,
+  boundedEquityAsset,
   isMarketSessionOpen,
   type AssetSpec,
 } from "./assets.ts";
@@ -16,11 +18,21 @@ describe("asset runtime contract", () => {
       marketDataKind: "ALPACA_IEX",
       session: "US_REGULAR",
       quantityMode: "WHOLE",
-      directionMode: "LONG_SHORT",
+      directionMode: "LONG_ONLY",
     });
     assert.equal(applyDirectionalCapability(SPY_SPEC, "LONG"), "LONG");
-    assert.equal(applyDirectionalCapability(SPY_SPEC, "SHORT"), "SHORT");
+    assert.equal(applyDirectionalCapability(SPY_SPEC, "SHORT"), "FLAT");
     assert.equal(applyDirectionalCapability(SPY_SPEC, "FLAT"), "FLAT");
+  });
+
+  it("defines exactly the bounded five-symbol long-only IEX equity registry", () => {
+    assert.deepEqual(BOUNDED_US_EQUITY_ASSETS.map((asset) => asset.symbol), ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]);
+    for (const asset of BOUNDED_US_EQUITY_ASSETS) {
+      assert.equal(asset.assetClass, "US_EQUITY"); assert.equal(asset.marketDataKind, "ALPACA_IEX");
+      assert.equal(asset.session, "US_REGULAR"); assert.equal(asset.quantityMode, "WHOLE"); assert.equal(asset.directionMode, "LONG_ONLY");
+    }
+    assert.equal(boundedEquityAsset("qqq").symbol, "QQQ");
+    assert.throws(() => boundedEquityAsset("TSLA"), /UNCONFIGURED_US_EQUITY_SYMBOL/);
   });
 
   it("preserves [09:30, 16:00) America/New_York eligibility", () => {

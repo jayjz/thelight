@@ -23,8 +23,33 @@ export const SPY_SPEC = {
   marketDataKind: "ALPACA_IEX",
   session: "US_REGULAR",
   quantityMode: "WHOLE",
-  directionMode: "LONG_SHORT",
+  directionMode: "LONG_ONLY",
 } as const satisfies AssetSpec;
+
+/** The complete, deliberately small IEX equity universe for ema_rsi_v1. */
+export const US_EQUITY_UNIVERSE = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"] as const;
+export type BoundedEquitySymbol = typeof US_EQUITY_UNIVERSE[number];
+
+const equitySpec = (symbol: BoundedEquitySymbol) => ({
+  symbol, assetClass: "US_EQUITY", marketDataKind: "ALPACA_IEX",
+  session: "US_REGULAR", quantityMode: "WHOLE", directionMode: "LONG_ONLY",
+} as const satisfies AssetSpec);
+
+export const QQQ_SPEC = equitySpec("QQQ");
+export const IWM_SPEC = equitySpec("IWM");
+export const AAPL_SPEC = equitySpec("AAPL");
+export const MSFT_SPEC = equitySpec("MSFT");
+export const BOUNDED_US_EQUITY_ASSETS = [SPY_SPEC, QQQ_SPEC, IWM_SPEC, AAPL_SPEC, MSFT_SPEC] as const;
+
+export function boundedEquityAsset(symbol: string): (typeof BOUNDED_US_EQUITY_ASSETS)[number] {
+  const asset = BOUNDED_US_EQUITY_ASSETS.find((candidate) => candidate.symbol === symbol.toUpperCase());
+  if (!asset) throw new Error("UNCONFIGURED_US_EQUITY_SYMBOL");
+  return asset;
+}
+
+export function isBoundedEquitySymbol(symbol: string): symbol is BoundedEquitySymbol {
+  return (US_EQUITY_UNIVERSE as readonly string[]).includes(symbol);
+}
 
 /**
  * Read-only crypto market-data identity for B2. This capability contract does

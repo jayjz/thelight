@@ -42,7 +42,7 @@ function sameAsset(left: AssetSpec, right: AssetSpec): boolean {
  * The sole B3 authority switch. A runtime identity can be durable without
  * receiving the type/capability needed to reach a broker mutation boundary.
  */
-export function runtimeCapabilityForAsset(asset: AssetSpec): WorkerRuntimeCapability {
+export function runtimeCapabilityForAsset(asset: AssetSpec, arm: PaperWorkerArm = "ema_trend_arm_c"): WorkerRuntimeCapability {
   if (sameAsset(asset, SPY_SPEC)) {
     return { kind: "DISPATCH_CAPABLE", brokerBoundary: "ALPACA_PAPER_EQUITY" };
   }
@@ -63,7 +63,7 @@ export function workerRuntimeIdentityFor(asset: AssetSpec, arm: PaperWorkerArm =
     decisionTimeframe,
     workerVersion,
     workerKey: `alpaca-paper:${asset.symbol}:${decisionTimeframe}:${workerVersion}`,
-    capability: runtimeCapabilityForAsset(asset),
+    capability: runtimeCapabilityForAsset(asset, arm),
   };
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ALPACA_PAPER_BASE_URL, type AlpacaConfig, type BrokerAccountSnapshot, type BrokerOrderState, type BrokerPositionSnapshot, type HistoricalStockBars, type OpenBrokerOrder } from "./alpaca.server.ts";
 import { AlpacaPaperWorker, MemoryAlpacaWorkerStore } from "./alpaca-worker.server.ts";
+import { QQQ_SPEC } from "./assets.ts";
 import { EMA_RSI_V1_WARMUP_BARS, emaRsiV1Strategy } from "./ema-rsi-v1.ts";
 import type { ExecutionIntent } from "./types.ts";
 
@@ -132,5 +133,21 @@ describe("ema_rsi_v1 PAPER worker gates", () => {
     for (const current of risingBars()) await stale.worker.processRawBar(current);
     assert.equal(stale.broker.posts, 0);
     assert.ok((await stale.store.listIntents("SPY", stale.worker.snapshot().workerKey)).some((row) => row.dispatchBlockReason === "LATEST_LIVE_BAR_STALE"));
+  });
+
+  it("runs QQQ as durable read-only evidence with no broker or trade-update authority", async () => {
+    let now = start + 60_000;
+    const store = new MemoryAlpacaWorkerStore();
+    const worker = new AlpacaPaperWorker({
+      config: { ...config, symbol: "QQQ" }, asset: QQQ_SPEC, store, arm: "ema_rsi_v1",
+      now: () => new Date(now), isRegularSession: () => true,
+    });
+    await worker.start();
+    for (const current of risingBars()) { now = current.t + 60_000; await worker.processRawBar(current); }
+    assert.equal(worker.snapshot().runtimeCapability, "READ_ONLY_DURABLE");
+    assert.equal(worker.snapshot().tradeUpdateStreamState, "DISCONNECTED");
+    assert.equal((await store.listIntents("QQQ", worker.snapshot().workerKey)).every((row) => row.dispatchBlockReason === "READ_ONLY_RUNTIME"), true);
+    assert.equal(store.decisionEvidence().every((evidence) => evidence.symbol === "QQQ"), true);
+    await worker.stop();
   });
 });
