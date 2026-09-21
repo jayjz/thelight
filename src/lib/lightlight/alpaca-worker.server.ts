@@ -17,6 +17,7 @@ import {
 } from "./alpaca.server.ts";
 import { MemoryAlpacaWorkerStore, SqlAlpacaWorkerStore, type AlpacaWorkerStore, type GapRecoveryAttempt, type WorkerCheckpoint, type WorkerLease } from "./alpaca-worker-store.server.ts";
 import { computeFeatures } from "./features.ts";
+import { EMA_RSI_V1_ID, emaRsiV1Strategy, type TargetPosition, type TradingStrategy } from "./ema-rsi-v1.ts";
 import { buildJevRequest, createMockJevAdapter } from "./jev.ts";
 import type { MarketSource } from "./market.ts";
 import { SPY_SPEC, isMarketSessionOpen, type AssetSpec } from "./assets.ts";
@@ -26,6 +27,7 @@ import {
   SPY_RUNTIME_IDENTITY,
   assertDispatchCapable,
   workerRuntimeIdentityFor,
+  type PaperWorkerArm,
   type DispatchCapableCapability,
   type WorkerRuntimeIdentity,
 } from "./runtime-identity.ts";
@@ -44,6 +46,7 @@ const DECISION_WIDTH_MS = 15 * 60_000;
 // computeFeatures currently gates readiness at index 20, so retain 21 complete
 // decision observations instead of changing the existing feature contract.
 const FEATURE_DECISION_OBSERVATIONS = 21;
+const EMA_RSI_V1_MAX_LIVE_BAR_AGE_MS = 2 * 60_000;
 
 export type WorkerState = "STOPPED" | "STARTING" | "RECONCILING" | "READY" | "HALTED";
 export type WorkerStreamState = "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "DEGRADED" | "RECONCILING";
@@ -57,12 +60,12 @@ export type AlpacaWorkerSnapshot = {
   workerKey: string;
   runtimeCapability: "DISPATCH_CAPABLE";
   feed: string;
-  decisionTimeframe: "15Min";
+  decisionTimeframe: "15Min" | "1Min";
   latestRawBarTimestamp: number | null;
   latestClosedDecisionBarTimestamp: number | null;
   latestDecisionId: string | null;
-  strategy: "ema_trend";
-  experimentArm: "C";
+  strategy: "ema_trend" | typeof EMA_RSI_V1_ID;
+  experimentArm: "C" | "ema_rsi_v1";
   riskState: string | null;
   brokerPosition: number | null;
   openOrderSummary: { count: number; clientOrderIds: string[] };
@@ -115,6 +118,8 @@ export type AlpacaPaperWorkerOptions = {
   /** Injectable bounded backoff for deterministic reconnect tests. */
   reconnectDelayMs?: (attempt: number) => number;
   sleep?: (milliseconds: number) => Promise<void>;
+  /** Defaults to the unchanged 15-minute Arm C worker. */
+  arm?: PaperWorkerArm;
 };
 
 const emptyCheckpoint = (): WorkerCheckpoint => ({
@@ -134,6 +139,7 @@ const emptyCheckpoint = (): WorkerCheckpoint => ({
   recoveryDispatchNotBeforeBucketMs: null,
   paperEquityHighWater: null,
   lastPaperEquity: null,
+  priorRiskApprovedTarget: null,
   haltReason: null,
 });
 
@@ -147,7 +153,9 @@ export function alpacaPaperWorkerKey(asset: AssetSpec = ALPACA_WORKER_ASSET): st
 }
 
 export function deterministicDecisionId(timestamp: number, runtime: WorkerRuntimeIdentity = SPY_RUNTIME_IDENTITY): string {
-  const identity = [runtime.asset.symbol, runtime.decisionTimeframe, timestamp, "ema_trend", "C", runtime.workerVersion].join("|");
+  const strategy = runtime.decisionTimeframe === "1Min" ? EMA_RSI_V1_ID : "ema_trend";
+  const arm = runtime.decisionTimeframe === "1Min" ? EMA_RSI_V1_ID : "C";
+  const identity = [runtime.asset.symbol, runtime.decisionTimeframe, timestamp, strategy, arm, runtime.workerVersion].join("|");
   return `LLP-${createHash("sha256").update(identity).digest("hex").slice(0, 32)}`;
 }
 
@@ -170,6 +178,8 @@ function newYorkDate(timestamp: number): string {
  */
 export class AlpacaPaperWorker {
   private readonly options: AlpacaPaperWorkerOptions;
+  private readonly arm: PaperWorkerArm;
+  private readonly targetStrategy: TradingStrategy | null;
   private readonly runtimeIdentity: WorkerRuntimeIdentity & { capability: DispatchCapableCapability };
   private state: WorkerState = "STOPPED";
   private readonly key: string;
@@ -200,20 +210,34 @@ export class AlpacaPaperWorker {
 
   constructor(options: AlpacaPaperWorkerOptions) {
     this.options = options;
+    this.arm = options.arm ?? "ema_trend_arm_c";
+    this.targetStrategy = this.arm === "ema_rsi_v1" ? emaRsiV1Strategy : null;
     if (options.config.paperBaseUrl !== "https://paper-api.alpaca.markets") throw new Error("LIVE_TRADING_FORBIDDEN");
     if (options.config.symbol !== ALPACA_WORKER_ASSET.symbol) throw new Error("ALPACA_WORKER_ONLY_SUPPORTS_SPY");
-    const runtimeIdentity = workerRuntimeIdentityFor(ALPACA_WORKER_ASSET);
+    const runtimeIdentity = workerRuntimeIdentityFor(ALPACA_WORKER_ASSET, this.arm);
     assertDispatchCapable(runtimeIdentity);
     this.runtimeIdentity = runtimeIdentity;
     this.key = this.runtimeIdentity.workerKey;
   }
 
+  private get decisionWidthMs(): number {
+    return this.targetStrategy?.timeframe === "1Min" ? 60_000 : DECISION_WIDTH_MS;
+  }
+
+  private get featureDecisionObservations(): number {
+    return this.targetStrategy?.warmupBars ?? FEATURE_DECISION_OBSERVATIONS;
+  }
+
+  private get isEmaRsiV1(): boolean {
+    return this.arm === "ema_rsi_v1";
+  }
+
   snapshot(): AlpacaWorkerSnapshot {
     return {
       mode: "ALPACA_PAPER", workerState: this.state, symbol: this.options.config.symbol, workerKey: this.key, runtimeCapability: this.runtimeIdentity.capability.kind, feed: this.options.config.dataFeed,
-      decisionTimeframe: "15Min", latestRawBarTimestamp: this.checkpoint.latestRawBarTimestamp,
+      decisionTimeframe: this.runtimeIdentity.decisionTimeframe, latestRawBarTimestamp: this.checkpoint.latestRawBarTimestamp,
       latestClosedDecisionBarTimestamp: this.checkpoint.latestClosedDecisionBarTimestamp, latestDecisionId: this.checkpoint.latestDecisionId,
-      strategy: "ema_trend", experimentArm: "C", riskState: this.riskState,
+      strategy: this.isEmaRsiV1 ? EMA_RSI_V1_ID : "ema_trend", experimentArm: this.isEmaRsiV1 ? "ema_rsi_v1" : "C", riskState: this.riskState,
       brokerPosition: this.brokerPosition?.quantity ?? null,
       openOrderSummary: { count: this.openOrders.length, clientOrderIds: this.openOrders.map((order) => order.clientOrderId) },
       latestBrokerOrderState: this.latestBrokerOrderState, lastTradeUpdateTimestamp: this.lastTradeUpdateTimestamp,
@@ -337,17 +361,17 @@ export class AlpacaPaperWorker {
       await this.recoverGap(gap.start, gap.end, observedAt);
       return;
     }
-    await this.processCompletedDecisionBars(Math.floor(bar.t / DECISION_WIDTH_MS) * DECISION_WIDTH_MS);
+    await this.processCompletedDecisionBars(Math.floor(bar.t / this.decisionWidthMs) * this.decisionWidthMs);
   }
 
   private async processCompletedDecisionBars(eligibleBucketStart?: number, evaluateOnly = false): Promise<void> {
     const rawStart = this.checkpoint.latestRawBarTimestamp === null ? undefined :
       // Retain the in-progress bucket plus the 21 completed observations that
       // the unchanged index-20 feature gate can require.
-      this.checkpoint.latestRawBarTimestamp - (FEATURE_DECISION_OBSERVATIONS + 1) * DECISION_WIDTH_MS;
+      this.checkpoint.latestRawBarTimestamp - (this.featureDecisionObservations + 1) * this.decisionWidthMs;
     const raw = await this.options.store.listClosedBars(this.options.config.symbol, rawStart);
     if (raw.length === 0) return;
-    const width = DECISION_WIDTH_MS;
+    const width = this.decisionWidthMs;
     const latestBucketStart = Math.floor(raw[raw.length - 1]!.t / width) * width;
     const buckets = new Map<number, ClosedBar[]>();
     for (const bar of raw) {
@@ -362,7 +386,7 @@ export class AlpacaPaperWorker {
     let previousStart: number | null = null;
     for (const [start, bars] of ordered) {
       const byTimestamp = new Map(bars.map((bar) => [bar.t, bar]));
-      const slots = Array.from({ length: 15 }, (_, index) => byTimestamp.get(start + index * 60_000));
+      const slots = Array.from({ length: width / 60_000 }, (_, index) => byTimestamp.get(start + index * 60_000));
       // Continuity is exchange-calendar semantics, not an injectable dispatch
       // test override. A test may veto dispatch without fabricating a gap.
       const regular = isMarketSessionOpen(ALPACA_WORKER_ASSET, start);
@@ -381,7 +405,7 @@ export class AlpacaPaperWorker {
       }
       const decisionBar = {
         t: start, open: slots[0]!.open, high: Math.max(...slots.map((slot) => slot!.high)),
-        low: Math.min(...slots.map((slot) => slot!.low)), close: slots[14]!.close,
+        low: Math.min(...slots.map((slot) => slot!.low)), close: slots.at(-1)!.close,
         volume: slots.reduce((sum, slot) => sum + slot!.volume, 0),
       };
       if (!regular) continue;
@@ -418,20 +442,29 @@ export class AlpacaPaperWorker {
       const decisionId = deterministicDecisionId(decisionBar.t, this.runtimeIdentity);
       const evidence = await this.decisionEvidence(trailingContinuous, index, decisionId);
       const inSession = (this.options.isRegularSession ?? ((timestamp) => isMarketSessionOpen(ALPACA_WORKER_ASSET, timestamp)))(decisionBar.t);
+      const stale = this.isEmaRsiV1 && this.isLiveBarStale(decisionBar.t);
+      const reconciliationComplete = this.checkpoint.lastReconciliationTimestamp !== null && this.state === "READY";
+      const armDispatchSafety = !this.isEmaRsiV1 || (!stale && reconciliationComplete && this.ownership !== null);
       const dispatchEligible = inSession && evidence.features.warmupComplete &&
-        this.checkpoint.featureContinuity === "HEALTHY" && this.checkpoint.recoveryState === "HEALTHY";
+        this.checkpoint.featureContinuity === "HEALTHY" && this.checkpoint.recoveryState === "HEALTHY" &&
+        armDispatchSafety;
+      const blockReason = !inSession ? "OUTSIDE_REGULAR_SESSION" :
+        this.checkpoint.recoveryState !== "HEALTHY" ? `MARKET_RECOVERY_${this.checkpoint.recoveryState}` :
+          this.checkpoint.featureContinuity !== "HEALTHY" || !evidence.features.warmupComplete ? "FEATURE_CONTINUITY_REBUILDING" :
+            this.isEmaRsiV1 && stale ? "LATEST_LIVE_BAR_STALE" :
+              this.isEmaRsiV1 && !reconciliationComplete ? "BROKER_RECONCILIATION_INCOMPLETE" :
+                this.isEmaRsiV1 && !this.ownership ? "DISPATCH_OWNERSHIP_REQUIRED" : null;
+      if (evidence.strategyDecision) evidence.strategyDecision.blockReason = blockReason;
       const intent: ExecutionIntent = {
         intentId: `${decisionId}:intent`, decisionId, createdAtBar: index, createdAtTimestamp: decisionBar.t,
         desiredAction: evidence.action, desiredPosition: evidence.targetPosition, status: dispatchEligible ? "PENDING" : "CANCELLED",
         executionModel: "ALPACA_PAPER", clientOrderId: deterministicClientOrderId(decisionId),
       };
-      const blockReason = !inSession ? "OUTSIDE_REGULAR_SESSION" :
-        this.checkpoint.recoveryState !== "HEALTHY" ? `MARKET_RECOVERY_${this.checkpoint.recoveryState}` :
-          !evidence.features.warmupComplete ? "FEATURE_CONTINUITY_REBUILDING" : null;
-      const persisted = await this.options.store.persistDecisionAndIntent(evidence, intent, blockReason);
+      const persisted = await this.options.store.persistDecisionAndIntent(this.key, evidence, intent, blockReason);
       if (!persisted.inserted) continue;
       this.checkpoint.latestClosedDecisionBarTimestamp = decisionBar.t;
       this.checkpoint.latestDecisionId = decisionId;
+      if (this.isEmaRsiV1) this.checkpoint.priorRiskApprovedTarget = evidence.targetPosition === 1 ? 1 : 0;
       this.riskState = evidence.risk.reasons.join(" ") || "PASS";
       if (dispatchEligible) {
         try {
@@ -465,7 +498,7 @@ export class AlpacaPaperWorker {
     const latest = await this.options.store.latestClosedBarTimestamp(this.options.config.symbol);
     if (latest === null) return;
     this.checkpoint.latestRawBarTimestamp = Math.max(this.checkpoint.latestRawBarTimestamp ?? 0, latest);
-    const start = latest - (FEATURE_DECISION_OBSERVATIONS + 1) * DECISION_WIDTH_MS;
+    const start = latest - (this.featureDecisionObservations + 1) * this.decisionWidthMs;
     const raw = await this.options.store.listClosedBars(this.options.config.symbol, start, latest);
     const present = new Set(raw.filter((bar) => Number.isFinite(bar.t) && bar.t % 60_000 === 0).map((bar) => bar.t));
     const gaps: Array<{ start: number; end: number }> = [];
@@ -491,7 +524,7 @@ export class AlpacaPaperWorker {
 
   private async recoverGap(start: number, end: number, detectedAt: string, evaluateOnly = false): Promise<void> {
     const recoveryAttemptId = randomUUID();
-    const dispatchNotBefore = (Math.floor(Date.parse(detectedAt) / DECISION_WIDTH_MS) + 1) * DECISION_WIDTH_MS;
+    const dispatchNotBefore = (Math.floor(Date.parse(detectedAt) / this.decisionWidthMs) + 1) * this.decisionWidthMs;
     let attempt: GapRecoveryAttempt = {
       recoveryAttemptId, workerKey: this.key, symbol: "SPY", missingStartMs: start, missingEndMs: end,
       state: "GAP_DETECTED", detectedAt, result: null, reason: null,
@@ -539,7 +572,7 @@ export class AlpacaPaperWorker {
       // The barrier uses verification completion, never merely gap detection:
       // queued live bars from a slow REST request cannot become retroactive.
       const completedAt = (this.options.now ?? (() => new Date()))().toISOString();
-      const completionBarrier = (Math.floor(Date.parse(completedAt) / DECISION_WIDTH_MS) + 1) * DECISION_WIDTH_MS;
+      const completionBarrier = (Math.floor(Date.parse(completedAt) / this.decisionWidthMs) + 1) * this.decisionWidthMs;
       this.checkpoint.recoveryCompletedAt = completedAt;
       this.checkpoint.recoveryDispatchNotBeforeBucketMs = Math.max(this.checkpoint.recoveryDispatchNotBeforeBucketMs ?? 0, completionBarrier);
       await this.processCompletedDecisionBars(undefined, evaluateOnly);
@@ -567,6 +600,50 @@ export class AlpacaPaperWorker {
     await this.refreshPaperEquity();
     const features = computeFeatures(candles);
     const feature = features[index]!;
+    if (this.targetStrategy) {
+      // Only the closed prefix through `index` is supplied. This is both the
+      // strategy boundary and the no-lookahead boundary for the 1-minute arm.
+      const completedBars = candles.slice(0, index + 1);
+      const priorTarget: TargetPosition = this.checkpoint.priorRiskApprovedTarget ?? 0;
+      const strategy = this.targetStrategy.evaluate({ completedBars, priorTarget });
+      const desired = strategy.targetPosition === 1 ? "LONG" : "FLAT";
+      const equityDrawdown = this.paperEquityDrawdown();
+      if (equityDrawdown === null) throw new Error("PAPER_EQUITY_UNAVAILABLE");
+      const risk = evaluateRisk({ desired, features: feature, equityDrawdown });
+      const finalRiskApprovedTarget: TargetPosition = risk.target === "LONG" ? 1 : 0;
+      const decisionTimestamp = (this.options.now ?? (() => new Date()))().getTime();
+      return {
+        id: decisionId,
+        timestamp: feature.timestamp,
+        barIndex: index,
+        symbol: ALPACA_WORKER_ASSET.symbol,
+        timeframe: this.targetStrategy.timeframe,
+        tradingMode: "ALPACA_PAPER",
+        marketSnapshot: candles[index]!,
+        features: feature,
+        strategyId: EMA_RSI_V1_ID,
+        strategyVersion: this.targetStrategy.version,
+        researchRefs: [],
+        risk,
+        action: risk.target,
+        targetPosition: finalRiskApprovedTarget,
+        abstained: strategy.targetPosition !== finalRiskApprovedTarget,
+        strategyDecision: {
+          decisionTimestamp,
+          sourceBarTimestamp: candles[index]!.t,
+          priorTarget,
+          proposedTarget: strategy.targetPosition,
+          finalRiskApprovedTarget,
+          blockReason: null,
+          runtime: { workerKey: this.key, workerVersion: this.runtimeIdentity.workerVersion, runId: this.runId },
+          evidenceLinks: {
+            marketBar: `closed_bars:${ALPACA_WORKER_ASSET.symbol}:${candles[index]!.t}`,
+            recoveryAttemptId: this.checkpoint.recoveryAttemptId,
+          },
+          features: strategy.features,
+        },
+      } as unknown as Evidence;
+    }
     const adapter = createMockJevAdapter();
     const signal = evaluateSignal("ema_trend", feature);
     const deterministicRegime = classifyDeterministicRegime(feature);
@@ -586,7 +663,16 @@ export class AlpacaPaperWorker {
     };
   }
 
+  private isLiveBarStale(sourceBarTimestamp: number): boolean {
+    const now = (this.options.now ?? (() => new Date()))().getTime();
+    return now - (sourceBarTimestamp + 60_000) > EMA_RSI_V1_MAX_LIVE_BAR_AGE_MS;
+  }
+
   private async dispatch(intent: ExecutionIntent): Promise<void> {
+    if (this.isEmaRsiV1 && this.isLiveBarStale(intent.createdAtTimestamp)) {
+      await this.options.store.putIntent({ ...intent, status: "CANCELLED" }, "LATEST_LIVE_BAR_STALE");
+      return;
+    }
     // Fresh broker reads are mandatory for every target. Local/replay position is never consulted.
     const position = await this.options.broker.position();
     if (position.symbol !== ALPACA_WORKER_ASSET.symbol || position.provenance !== "ALPACA_RECONCILED" || !Number.isFinite(position.quantity)) {
@@ -639,7 +725,7 @@ export class AlpacaPaperWorker {
     this.brokerPosition = position;
     await this.options.store.appendBrokerPosition(position);
     this.openOrders = await this.options.broker.openOrders();
-    const intents = await this.options.store.listIntents(ALPACA_WORKER_ASSET.symbol);
+    const intents = await this.options.store.listIntents(ALPACA_WORKER_ASSET.symbol, this.key);
     const knownClientIds = new Set(intents.map(({ intent }) => intent.clientOrderId ?? intent.intentId));
     const unknownOpenOrder = this.openOrders.find((order) => !knownClientIds.has(order.clientOrderId));
     if (unknownOpenOrder) throw new Error(`CONTRADICTORY_OPEN_BROKER_ORDER:${unknownOpenOrder.clientOrderId || "MISSING_CLIENT_ORDER_ID"}`);
@@ -706,7 +792,7 @@ export class AlpacaPaperWorker {
     await this.options.store.appendTradeUpdate(update, clientOrderId);
     this.lastTradeUpdateTimestamp = (this.options.now ?? (() => new Date()))().toISOString();
     if (!clientOrderId) return this.persistCheckpoint();
-    const stored = (await this.options.store.listIntents(ALPACA_WORKER_ASSET.symbol)).find(({ intent }) => (intent.clientOrderId ?? intent.intentId) === clientOrderId);
+    const stored = (await this.options.store.listIntents(ALPACA_WORKER_ASSET.symbol, this.key)).find(({ intent }) => (intent.clientOrderId ?? intent.intentId) === clientOrderId);
     if (stored) {
       const state = brokerStateFromTradeUpdate(update, stored.intent);
       if (state) await this.recordBrokerState(stored.intent, state, stored.dispatchBlockReason);
@@ -838,6 +924,7 @@ export class AlpacaPaperWorker {
       recoveryDispatchNotBeforeBucketMs: Number.isFinite(checkpoint.recoveryDispatchNotBeforeBucketMs) ? checkpoint.recoveryDispatchNotBeforeBucketMs : null,
       paperEquityHighWater: Number.isFinite(checkpoint.paperEquityHighWater) ? checkpoint.paperEquityHighWater : null,
       lastPaperEquity: Number.isFinite(checkpoint.lastPaperEquity) ? checkpoint.lastPaperEquity : null,
+      priorRiskApprovedTarget: checkpoint.priorRiskApprovedTarget === 1 ? 1 : checkpoint.priorRiskApprovedTarget === 0 ? 0 : null,
     };
   }
 
@@ -933,7 +1020,7 @@ export class AlpacaPaperWorker {
   }
 }
 
-const globalRef = globalThis as typeof globalThis & { __alpacaPaperWorker__?: Promise<AlpacaPaperWorker> };
+const globalRef = globalThis as typeof globalThis & { __alpacaPaperWorkers__?: Partial<Record<PaperWorkerArm, Promise<AlpacaPaperWorker>>> };
 
 /**
  * Runtime singleton for the explicitly launched worker process.
@@ -943,28 +1030,29 @@ const globalRef = globalThis as typeof globalThis & { __alpacaPaperWorker__?: Pr
  * trade-update streams, so fail closed before configuration, database, or
  * socket initialization if this factory is ever reached there.
  */
-export function getAlpacaPaperWorker(): Promise<AlpacaPaperWorker> {
+export function getAlpacaPaperWorker(arm: PaperWorkerArm = "ema_trend_arm_c"): Promise<AlpacaPaperWorker> {
   if (process.env.VERCEL === "1") {
     throw new Error("ALPACA_WORKER_FORBIDDEN_ON_VERCEL");
   }
-  globalRef.__alpacaPaperWorker__ ??= (async () => {
+  const workers = globalRef.__alpacaPaperWorkers__ ??= {};
+  workers[arm] ??= (async () => {
     const config = loadAlpacaConfig();
     const worker = new AlpacaPaperWorker({
       config, store: new SqlAlpacaWorkerStore(), broker: new AlpacaPaperBroker(config),
-      source: new AlpacaMarketSource(config), tradeUpdates: new AlpacaPaperTradeUpdates(config),
+      source: new AlpacaMarketSource(config), tradeUpdates: new AlpacaPaperTradeUpdates(config), arm,
     });
     await worker.start();
     return worker;
   })().catch((error) => {
-    globalRef.__alpacaPaperWorker__ = undefined;
+    delete workers[arm];
     throw error;
   });
-  return globalRef.__alpacaPaperWorker__;
+  return workers[arm]!;
 }
 
 /** Read-only operator status; unlike getAlpacaPaperWorker it does not start work. */
-export async function readAlpacaPaperWorkerSnapshot(): Promise<AlpacaWorkerSnapshot | null> {
-  const worker = await globalRef.__alpacaPaperWorker__;
+export async function readAlpacaPaperWorkerSnapshot(arm: PaperWorkerArm = "ema_trend_arm_c"): Promise<AlpacaWorkerSnapshot | null> {
+  const worker = await globalRef.__alpacaPaperWorkers__?.[arm];
   return worker?.snapshot() ?? null;
 }
 

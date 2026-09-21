@@ -17,7 +17,7 @@ export type DurableMarketWorkerSnapshot = {
   workerKey: string;
   symbol: string;
   assetClass: string;
-  decisionTimeframe: "15Min";
+  decisionTimeframe: "15Min" | "1Min";
   runtimeCapability: ReadOnlyDurableCapability["kind"];
   state: "STOPPED" | "STARTING" | "READY" | "HALTED";
   latestRawBarTimestamp: number | null;
@@ -50,6 +50,7 @@ function emptyCheckpoint(): WorkerCheckpoint {
     recoveryDispatchNotBeforeBucketMs: null,
     paperEquityHighWater: null,
     lastPaperEquity: null,
+    priorRiskApprovedTarget: null,
     haltReason: null,
   };
 }

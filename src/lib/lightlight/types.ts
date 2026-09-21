@@ -290,6 +290,18 @@ export type Evidence = {
   /** Requested target only; an actual position changes only in the ledger. */
   targetPosition: number;
   abstained: boolean;
+  /** Present for PAPER strategies that emit a target directly without Jev. */
+  strategyDecision?: {
+    decisionTimestamp: number;
+    sourceBarTimestamp: number;
+    priorTarget: 0 | 1;
+    proposedTarget: 0 | 1;
+    finalRiskApprovedTarget: 0 | 1;
+    blockReason: string | null;
+    runtime: { workerKey: string; workerVersion: string; runId: string | null };
+    evidenceLinks: { marketBar: string; recoveryAttemptId: string | null };
+    features: Record<string, number | string | boolean>;
+  };
 };
 
 export type PathMetrics = {

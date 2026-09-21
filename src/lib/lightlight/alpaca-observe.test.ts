@@ -79,6 +79,17 @@ describe("Alpaca PAPER terminal observer", () => {
     assert.doesNotMatch(output, /🟢 CONTINUITY/);
   });
 
+  it("renders the ema_rsi_v1 decision fields without changing the observer layout", () => {
+    const output = renderCurrentState(snapshot({ decisions: [decision({
+      strategyId: "ema_rsi_v1", strategyVersion: "v1", ema9: 600.125, ema21: 599.875, rsi14: 57.4,
+      finalRiskApprovedTarget: 1, blockReason: "LATEST_LIVE_BAR_STALE",
+    })] }));
+    assert.match(output, /ema_rsi_v1/);
+    assert.match(output, /EMA9=600\.125\s+EMA21=599\.875\s+RSI14=57\.4/);
+    assert.match(output, /LONG → target 1/);
+    assert.match(output, /blocked: LATEST_LIVE_BAR_STALE/);
+  });
+
   it("renders every durable market-recovery state without exposing provider payloads", () => {
     assert.equal(classifyRecovery("GAP_DETECTED").label, "gap detected (safe gate)");
     assert.equal(classifyRecovery("BACKFILLING").label, "backfilling (safe gate)");

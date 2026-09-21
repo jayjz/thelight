@@ -3,6 +3,10 @@ import { BTC_USD_SPEC, SPY_SPEC, type AssetSpec } from "./assets.ts";
 /** The durable identity format is a compatibility contract, not display text. */
 export const ALPACA_PAPER_DECISION_TIMEFRAME = "15Min" as const;
 export const ALPACA_PAPER_WORKER_VERSION = "alpaca-paper-worker-v1" as const;
+export const EMA_RSI_V1_DECISION_TIMEFRAME = "1Min" as const;
+export const EMA_RSI_V1_WORKER_VERSION = "ema-rsi-v1-paper-worker-v1" as const;
+
+export type PaperWorkerArm = "ema_trend_arm_c" | "ema_rsi_v1";
 
 export type ReadOnlyDurableCapability = {
   kind: "READ_ONLY_DURABLE";
@@ -19,8 +23,8 @@ export type WorkerRuntimeCapability = ReadOnlyDurableCapability | DispatchCapabl
 export type WorkerRuntimeIdentity = {
   asset: AssetSpec;
   executionMode: "ALPACA_PAPER";
-  decisionTimeframe: typeof ALPACA_PAPER_DECISION_TIMEFRAME;
-  workerVersion: typeof ALPACA_PAPER_WORKER_VERSION;
+  decisionTimeframe: typeof ALPACA_PAPER_DECISION_TIMEFRAME | typeof EMA_RSI_V1_DECISION_TIMEFRAME;
+  workerVersion: typeof ALPACA_PAPER_WORKER_VERSION | typeof EMA_RSI_V1_WORKER_VERSION;
   workerKey: string;
   capability: WorkerRuntimeCapability;
 };
@@ -49,18 +53,22 @@ export function runtimeCapabilityForAsset(asset: AssetSpec): WorkerRuntimeCapabi
  * Pure, deterministic durable identity derived from the explicit asset
  * contract. SPY's resulting worker key is intentionally byte-for-byte legacy.
  */
-export function workerRuntimeIdentityFor(asset: AssetSpec): WorkerRuntimeIdentity {
+export function workerRuntimeIdentityFor(asset: AssetSpec, arm: PaperWorkerArm = "ema_trend_arm_c"): WorkerRuntimeIdentity {
+  const emaRsi = arm === "ema_rsi_v1";
+  const decisionTimeframe = emaRsi ? EMA_RSI_V1_DECISION_TIMEFRAME : ALPACA_PAPER_DECISION_TIMEFRAME;
+  const workerVersion = emaRsi ? EMA_RSI_V1_WORKER_VERSION : ALPACA_PAPER_WORKER_VERSION;
   return {
     asset,
     executionMode: "ALPACA_PAPER",
-    decisionTimeframe: ALPACA_PAPER_DECISION_TIMEFRAME,
-    workerVersion: ALPACA_PAPER_WORKER_VERSION,
-    workerKey: `alpaca-paper:${asset.symbol}:${ALPACA_PAPER_DECISION_TIMEFRAME}:${ALPACA_PAPER_WORKER_VERSION}`,
+    decisionTimeframe,
+    workerVersion,
+    workerKey: `alpaca-paper:${asset.symbol}:${decisionTimeframe}:${workerVersion}`,
     capability: runtimeCapabilityForAsset(asset),
   };
 }
 
 export const SPY_RUNTIME_IDENTITY = workerRuntimeIdentityFor(SPY_SPEC);
+export const SPY_EMA_RSI_V1_RUNTIME_IDENTITY = workerRuntimeIdentityFor(SPY_SPEC, "ema_rsi_v1");
 export const BTC_USD_RUNTIME_IDENTITY = workerRuntimeIdentityFor(BTC_USD_SPEC);
 
 export function assertDispatchCapable(

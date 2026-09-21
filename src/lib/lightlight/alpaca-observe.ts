@@ -5,6 +5,7 @@
  */
 
 export const DEFAULT_ALPACA_PAPER_WORKER_KEY = "alpaca-paper:SPY:15Min:alpaca-paper-worker-v1";
+export const EMA_RSI_V1_ALPACA_PAPER_WORKER_KEY = "alpaca-paper:SPY:1Min:ema-rsi-v1-paper-worker-v1";
 export const DEFAULT_OBSERVER_SYMBOL = "SPY";
 
 export type ObserverQuery = {
@@ -68,6 +69,14 @@ export type ObserverDecision = {
   action: string | null;
   targetPosition: number | null;
   riskReasons: string[];
+  strategyId?: string | null;
+  strategyVersion?: string | null;
+  ema9?: number | null;
+  ema21?: number | null;
+  rsi14?: number | null;
+  proposedTarget?: number | null;
+  finalRiskApprovedTarget?: number | null;
+  blockReason?: string | null;
   intent: ObserverIntent | null;
 };
 
@@ -186,6 +195,8 @@ function decisionFrom(row: JsonRecord): ObserverDecision {
   const signal = asRecord(evidence.deterministicSignal);
   const policy = asRecord(evidence.policy);
   const risk = asRecord(evidence.risk);
+  const strategyDecision = asRecord(evidence.strategyDecision);
+  const strategyFeatures = asRecord(strategyDecision.features);
   return {
     decisionId: asString(row.decision_id) ?? "unknown",
     timestamp: asNumber(row.decision_timestamp_ms) ?? asNumber(evidence.timestamp),
@@ -197,6 +208,14 @@ function decisionFrom(row: JsonRecord): ObserverDecision {
     action: asString(evidence.action),
     targetPosition: asNumber(evidence.targetPosition),
     riskReasons: asReasons(risk.reasons),
+    strategyId: asString(evidence.strategyId),
+    strategyVersion: asString(evidence.strategyVersion),
+    ema9: asNumber(strategyFeatures.ema9),
+    ema21: asNumber(strategyFeatures.ema21),
+    rsi14: asNumber(strategyFeatures.rsi14),
+    proposedTarget: asNumber(strategyDecision.proposedTarget),
+    finalRiskApprovedTarget: asNumber(strategyDecision.finalRiskApprovedTarget),
+    blockReason: asString(strategyDecision.blockReason),
     intent: intentFrom(row),
   };
 }
@@ -215,8 +234,8 @@ export async function loadObserverSnapshot(
   const barResult = await query.query("select timestamp_ms::text from closed_bars where symbol = $1 order by timestamp_ms desc limit 1", [symbol]);
   const positionResult = await query.query("select quantity, reconciled_at::text from broker_positions where symbol = $1 order by reconciled_at desc, position_id desc limit 1", [symbol]);
   const tradeResult = await query.query("select received_at::text from trade_updates order by received_at desc limit 1");
-  const decisionResult = await query.query("select d.decision_id, d.decision_timestamp_ms::text, d.evidence_json, d.created_at::text as decision_created_at, i.intent_id, i.decision_id, i.status as intent_status, i.intent_json, i.dispatch_block_reason, i.updated_at::text as intent_updated_at from decisions d left join execution_intents i on i.decision_id = d.decision_id where d.symbol = $1 order by d.decision_timestamp_ms desc, d.created_at desc limit 12", [symbol]);
-  const brokerResult = await query.query("select b.event_id, b.intent_id, b.broker_order_id, b.status, b.lookup_state, b.observed_at::text from broker_orders b join execution_intents i on i.intent_id = b.intent_id join decisions d on d.decision_id = i.decision_id where d.symbol = $1 order by b.observed_at desc, b.event_id desc limit 20", [symbol]);
+  const decisionResult = await query.query("select d.decision_id, d.decision_timestamp_ms::text, d.evidence_json, d.created_at::text as decision_created_at, i.intent_id, i.decision_id, i.status as intent_status, i.intent_json, i.dispatch_block_reason, i.updated_at::text as intent_updated_at from decisions d left join execution_intents i on i.decision_id = d.decision_id where d.symbol = $1 and d.worker_key = $2 order by d.decision_timestamp_ms desc, d.created_at desc limit 12", [symbol, workerKey]);
+  const brokerResult = await query.query("select b.event_id, b.intent_id, b.broker_order_id, b.status, b.lookup_state, b.observed_at::text from broker_orders b join execution_intents i on i.intent_id = b.intent_id join decisions d on d.decision_id = i.decision_id where d.symbol = $1 and d.worker_key = $2 order by b.observed_at desc, b.event_id desc limit 20", [symbol, workerKey]);
   const updateResult = await query.query("select update_id, client_order_id, received_at::text from trade_updates order by received_at desc, update_id desc limit 20");
   const recoveryResult = await query.query("select recovery_attempt_id, state, missing_start_ms::text, missing_end_ms::text, detected_at::text, requested_at::text, verified_at::text, completed_at::text, returned_bar_count, verified_bar_count, result, reason from market_gap_recovery_attempts where worker_key = $1 and symbol = $2 order by detected_at desc limit 1", [workerKey, symbol]);
 
@@ -339,6 +358,10 @@ function formatMoney(value: number | null): string {
 }
 
 function decisionSummary(decision: ObserverDecision): string {
+  if (decision.strategyId === "ema_rsi_v1") {
+    const target = decision.finalRiskApprovedTarget ?? decision.targetPosition;
+    return `${decision.strategyId}\n      EMA9=${decision.ema9?.toFixed(3) ?? "--"}  EMA21=${decision.ema21?.toFixed(3) ?? "--"}  RSI14=${decision.rsi14?.toFixed(1) ?? "--"}\n      ${target === 1 ? "LONG" : "FLAT"} → target ${target ?? "?"}`;
+  }
   const strategy = decision.strategySignal ?? decision.action ?? "UNKNOWN";
   const target = decision.targetPosition === null ? "?" : String(decision.targetPosition);
   return `🧠 ${strategy} → target ${target}`;
@@ -383,7 +406,8 @@ export function renderCurrentState(snapshot: ObserverSnapshot, options: { verbos
   } else {
     for (const decision of snapshot.decisions.slice(0, 3)) {
       lines.push(`${formatEt(decision.timestamp)} ${decisionSummary(decision)}`);
-      if (decision.intent?.dispatchBlockReason) lines.push(`      ⛔ blocked: ${sanitizeTerminalText(decision.intent.dispatchBlockReason)}`);
+      const blockReason = decision.intent?.dispatchBlockReason ?? decision.blockReason;
+      if (blockReason) lines.push(`      ⛔ blocked: ${sanitizeTerminalText(blockReason)}`);
       else if (decision.intent) lines.push(`      ${intentSummary(decision.intent)}`);
       if (options.verbose) {
         const reasons = [decision.strategyReason, decision.policyReason, ...decision.riskReasons].filter(Boolean).map((reason) => sanitizeTerminalText(reason)).filter(Boolean);

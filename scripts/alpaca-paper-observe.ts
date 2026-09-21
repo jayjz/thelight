@@ -6,6 +6,7 @@
 import pg from "pg";
 import {
   DEFAULT_ALPACA_PAPER_WORKER_KEY,
+  EMA_RSI_V1_ALPACA_PAPER_WORKER_KEY,
   DEFAULT_OBSERVER_SYMBOL,
   ObserverChangeDetector,
   formatEt,
@@ -16,11 +17,11 @@ import {
   type ObserverQuery,
 } from "../src/lib/lightlight/alpaca-observe.ts";
 
-type Options = { once: boolean; intervalMs: number; verbose: boolean };
+type Options = { once: boolean; intervalMs: number; verbose: boolean; workerKey: string };
 
 function usage(): string {
   return [
-    "usage: npm run alpaca:observe [-- --once] [--interval seconds] [--verbose]",
+    "usage: npm run alpaca:observe [-- --once] [--interval seconds] [--verbose] [--arm ema_rsi_v1]",
     "",
     "Reads durable PAPER evidence only. It does not need Alpaca credentials.",
   ].join("\n");
@@ -29,11 +30,16 @@ function usage(): string {
 function parseOptions(args: string[]): Options | null {
   let once = false;
   let verbose = false;
+  let workerKey = DEFAULT_ALPACA_PAPER_WORKER_KEY;
   let intervalMs = 1_500;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--once") once = true;
     else if (arg === "--verbose") verbose = true;
+    else if (arg === "--arm" && args[index + 1] === "ema_rsi_v1") {
+      workerKey = EMA_RSI_V1_ALPACA_PAPER_WORKER_KEY;
+      index += 1;
+    }
     else if (arg === "--interval") {
       const seconds = Number(args[index + 1]);
       if (!Number.isFinite(seconds) || seconds < 0.5 || seconds > 60) return null;
@@ -42,10 +48,10 @@ function parseOptions(args: string[]): Options | null {
     } else if (arg === "--help" || arg === "-h") return null;
     else return null;
   }
-  return { once, intervalMs, verbose };
+  return { once, intervalMs, verbose, workerKey };
 }
 
-async function snapshotInReadOnlyTransaction(client: InstanceType<typeof pg.Client>) {
+async function snapshotInReadOnlyTransaction(client: InstanceType<typeof pg.Client>, workerKey: string) {
   await client.query("BEGIN READ ONLY");
   let committed = false;
   try {
@@ -55,7 +61,7 @@ async function snapshotInReadOnlyTransaction(client: InstanceType<typeof pg.Clie
         return { rows: result.rows as T[] };
       },
     };
-    const snapshot = await loadObserverSnapshot(query, DEFAULT_ALPACA_PAPER_WORKER_KEY, DEFAULT_OBSERVER_SYMBOL);
+    const snapshot = await loadObserverSnapshot(query, workerKey, DEFAULT_OBSERVER_SYMBOL);
     await client.query("COMMIT");
     committed = true;
     return snapshot;
@@ -101,7 +107,7 @@ async function main(): Promise<void> {
 
   try {
     await client.connect();
-    let snapshot = await snapshotInReadOnlyTransaction(client);
+    let snapshot = await snapshotInReadOnlyTransaction(client, options.workerKey);
     detector.observe(snapshot); // Show current durable state, not a synthetic replay.
     console.log(renderCurrentState(snapshot, { verbose: options.verbose }));
     if (options.once) return;
@@ -111,7 +117,7 @@ async function main(): Promise<void> {
       await waitForInterval(options.intervalMs, (release) => { releaseWait = release; });
       releaseWait = null;
       if (stopping) break;
-      snapshot = await snapshotInReadOnlyTransaction(client);
+      snapshot = await snapshotInReadOnlyTransaction(client, options.workerKey);
       for (const event of detector.observe(snapshot)) console.log(renderEvent(event));
       if (Date.now() - lastHeaderAt >= 10_000) {
         console.log(`\n${renderCurrentState(snapshot, { verbose: options.verbose })}`);
