@@ -87,6 +87,17 @@ a SPY bar without submitting an order:
 npm run alpaca:worker:smoke -- --observe-only
 ```
 
+For a compact, read-only stream of the worker's durable PAPER evidence in a
+separate terminal window, run:
+
+```sh
+npm run alpaca:observe
+```
+
+The observer requires only `DATABASE_URL`; it does not connect to Alpaca or
+need Alpaca credentials. Use `-- --once`, `-- --interval 2`, or `-- --verbose`
+for a one-shot snapshot, a custom polling interval, or decision reasons.
+
 The worker and smoke commands are intentionally excluded from CI. See the
 [Alpaca PAPER worker guide](docs/ALPACA_PAPER_WORKER.md) for operator controls,
 the explicit dispatch procedure, and its fail-closed recovery behavior.

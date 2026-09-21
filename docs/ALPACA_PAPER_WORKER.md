@@ -17,6 +17,19 @@ It requires a durable `DATABASE_URL`; a process without it halts before it can
 connect streams or submit an order. Stop that session process with `SIGINT` or
 `SIGTERM`.
 
+To observe durable PAPER evidence from a separate terminal without starting,
+stopping, or controlling that worker, run:
+
+```sh
+npm run alpaca:observe
+```
+
+This observer polls bounded, existing Postgres evidence in short read-only
+transactions. It uses `DATABASE_URL` only: it does not read or use Alpaca
+credentials, open Alpaca connections, acquire a lease, or issue broker actions. `-- --once`,
+`-- --interval 2`, and `-- --verbose` respectively provide a one-shot view, a
+custom interval, and extra decision reasoning.
+
 ## Authority and state
 
 Dispatch authority is durable and single-owner across processes. Before broker
