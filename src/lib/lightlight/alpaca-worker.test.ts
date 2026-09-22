@@ -297,7 +297,7 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     const submitted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
     await store.putIntent({ ...submitted, status: "SUBMISSION_ATTEMPTED" });
     const clientOrderId = submitted.clientOrderId!;
-    broker.found.set(clientOrderId, { decisionId: submitted.decisionId, intentId: submitted.intentId, clientOrderId, brokerOrderId: "adopted-attempt", status: "ACCEPTED", updatedAt: "2026-09-19T14:00:00.000Z", rawStatus: "accepted", lookup: "FOUND" });
+    broker.found.set(clientOrderId, { decisionId: submitted.decisionId, intentId: submitted.intentId, clientOrderId, brokerOrderId: "broker-1", status: "ACCEPTED", updatedAt: "2026-09-19T14:00:00.000Z", rawStatus: "accepted", lookup: "FOUND" });
     const posts = broker.posts;
     await first.stop(); const recreated = worker(store, broker); await recreated.start();
     assert.equal(recreated.snapshot().workerState, "READY");
@@ -331,7 +331,7 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     const target = new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, isRegularSession: () => true, now: fixtureNow, sleep: async () => undefined });
     await runToDispatch(target, broker);
     const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
-    await target.processTradeUpdate({ stream: "trade_updates", data: { event: "fill", order: { id: "broker-1", status: "filled", client_order_id: accepted.clientOrderId } } });
+    await target.processTradeUpdate({ stream: "trade_updates", data: { event: "fill", order: { id: "broker-1", status: "filled", symbol: "SPY", client_order_id: accepted.clientOrderId } } });
     assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
     const accountCalls = broker.accountCalls;
     await target.handleTradeStreamError(new Error("socket lost"));
@@ -342,6 +342,140 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     await outside.start(); for (const bar of rawBars()) await outside.processRawBar(bar);
     assert.equal(outBroker.posts, 0);
     assert.ok((await outStore.listIntents()).some((row) => row.dispatchBlockReason === "OUTSIDE_REGULAR_SESSION"));
+  });
+
+  it("converges an ACCEPTED intent on fill and ignores duplicate, replayed, and late nonterminal updates", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
+    await runToDispatch(target, broker);
+    const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    const update = { stream: "trade_updates", data: { event: "fill", order: { id: "broker-1", status: "filled", symbol: "SPY", client_order_id: accepted.clientOrderId } } };
+    const posts = broker.posts;
+    await target.processTradeUpdate(update);
+    await target.processTradeUpdate(update);
+    await target.processTradeUpdate({ ...update, data: { event: "new", order: { ...update.data.order, status: "new" } } });
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
+    assert.equal(store.updates.length, 3, "all stream observations remain durable evidence");
+    assert.equal(store.posts.filter((state) => state.intentId === accepted.intentId && state.status === "FILLED").length, 2);
+    assert.equal(broker.posts, posts, "trade updates never authorize another POST");
+    await target.stop();
+    const recreated = worker(store, broker); await recreated.start();
+    await recreated.processTradeUpdate(update);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
+    assert.equal(broker.posts, posts);
+  });
+
+  it("adopts broker-authoritative FILLED from SUBMISSION_ATTEMPTED without reposting", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const submitted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    await store.putIntent({ ...submitted, status: "SUBMISSION_ATTEMPTED" });
+    broker.found.set(submitted.clientOrderId!, { decisionId: submitted.decisionId, intentId: submitted.intentId, clientOrderId: submitted.clientOrderId!, brokerOrderId: "broker-1", status: "FILLED", updatedAt: "2026-09-22T14:00:00.000Z", rawStatus: "filled", lookup: "FOUND" });
+    const posts = broker.posts;
+    await first.stop(); const recreated = worker(store, broker); await recreated.start();
+    assert.equal(recreated.snapshot().workerState, "READY");
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === submitted.intentId)?.intent.status, "FILLED");
+    assert.equal(broker.posts, posts);
+  });
+
+  it("terminalizes a no-op position match after the fenced claim and stays restartable", async () => {
+    class NoOpBroker extends FakeBroker {
+      override async submit(intent: ExecutionIntent): Promise<BrokerOrderState> {
+        this.posts += 1;
+        return { decisionId: intent.decisionId, intentId: intent.intentId, clientOrderId: intent.clientOrderId!, brokerOrderId: null, status: "CANCELLED", updatedAt: null, rawStatus: null, lookup: "ABSENT" };
+      }
+    }
+    const store = new MemoryAlpacaWorkerStore(); const broker = new NoOpBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const noOp = (await store.listIntents()).find(({ intent }) => intent.status === "CANCELLED" && store.posts.some((state) => state.intentId === intent.intentId && state.lookup === "ABSENT" && state.status === "CANCELLED"));
+    assert.ok(noOp, "position match should finish the claimed intent without an order");
+    const submits = broker.posts;
+    await first.stop(); const recreated = worker(store, broker); await recreated.start();
+    assert.equal(recreated.snapshot().workerState, "READY");
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === noOp.intent.intentId)?.intent.status, "CANCELLED");
+    assert.equal(broker.posts, submits);
+  });
+
+  it("keeps partial fills nonterminal and preserves canceled, rejected, expired, and done-for-day semantics", async () => {
+    for (const [event, expected] of [["canceled", "CANCELLED"], ["rejected", "REJECTED"], ["expired", "CANCELLED"], ["done_for_day", "CANCELLED"]] as const) {
+      const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
+      await runToDispatch(target, broker);
+      const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+      const order = { id: "broker-1", symbol: "SPY", client_order_id: accepted.clientOrderId };
+      await target.processTradeUpdate({ stream: "trade_updates", data: { event: "partial_fill", order: { ...order, status: "partially_filled" } } });
+      assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "PARTIALLY_FILLED");
+      await target.processTradeUpdate({ stream: "trade_updates", data: { event, order: { ...order, status: event } } });
+      assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, expected);
+      await target.processTradeUpdate({ stream: "trade_updates", data: { event: "partial_fill", order: { ...order, status: "partially_filled" } } });
+      assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, expected);
+    }
+  });
+
+  it("persists but cannot apply unknown, malformed, wrong-symbol, or wrong-order updates", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
+    await runToDispatch(target, broker);
+    const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    const order = { id: "broker-1", status: "filled", symbol: "SPY", client_order_id: accepted.clientOrderId };
+    const posts = broker.posts;
+    const invalid = [
+      { stream: "trade_updates", data: { event: "fill", order: { ...order, client_order_id: "unknown-client-order" } } },
+      { stream: "trade_updates", data: { event: "fill", order: { ...order, symbol: "QQQ" } } },
+      { stream: "trade_updates", data: { event: "fill", order: { ...order, id: "" } } },
+      { stream: "trade_updates", data: { event: "fill", order: null } },
+      { stream: "trade_updates", data: { event: "partial_fill", order: { ...order, status: "partially_filled" } } },
+    ];
+    for (const update of invalid.slice(0, 4)) await target.processTradeUpdate(update);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "ACCEPTED");
+    await target.processTradeUpdate(invalid[4]!);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "PARTIALLY_FILLED");
+    await assert.rejects(() => target.processTradeUpdate({ stream: "trade_updates", data: { event: "fill", order: { ...order, id: "another-order" } } }), /CORRELATION_LOST/);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "PARTIALLY_FILLED");
+    assert.equal(store.updates.length, 6);
+    assert.equal(broker.posts, posts);
+  });
+
+  it("repairs the September 22 FILLED broker and trade evidence with stale ACCEPTED projection on restart", async () => {
+    const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "fixtures/paper-fill-stale-accepted.json"), "utf8")) as {
+      observedAt: string; intentStatus: "ACCEPTED"; brokerOrder: Pick<BrokerOrderState, "brokerOrderId" | "status" | "rawStatus" | "lookup">;
+      tradeUpdate: { stream: string; data: { event: string; order: { id: string; client_order_id: string; symbol: string; status: string } } };
+    };
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const accepted = (await store.listIntents()).find(({ intent }) => intent.status === fixture.intentStatus)!.intent;
+    const filled = { ...fixture.brokerOrder, decisionId: accepted.decisionId, intentId: accepted.intentId, clientOrderId: accepted.clientOrderId!, updatedAt: fixture.observedAt };
+    store.posts.push(filled);
+    store.updates.push({ update: { ...fixture.tradeUpdate, data: { ...fixture.tradeUpdate.data, order: { ...fixture.tradeUpdate.data.order, client_order_id: accepted.clientOrderId! } } }, clientOrderId: accepted.clientOrderId! });
+    broker.found.set(accepted.clientOrderId!, filled);
+    const posts = broker.posts; const observations = [...store.posts]; const updates = store.updates.length;
+    await first.stop(); const recreated = worker(store, broker); await recreated.start();
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
+    assert.deepEqual(store.posts.slice(0, observations.length), observations, "reconciliation retains prior broker evidence");
+    assert.ok(store.posts.length > observations.length, "reconciliation appends broker evidence");
+    assert.equal(store.updates.length, updates, "persisted fill update stays intact");
+    assert.equal(broker.posts, posts);
+  });
+
+  it("does not let a stale fence project a fill or claim POST authority", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    const postCount = broker.posts;
+    await first.stop();
+    const key = alpacaPaperWorkerKey();
+    const scope = { workerKey: key, asset: { symbol: "SPY" } };
+    const oldLease = await store.acquireOwnership(key, "old-run", 30);
+    assert.ok(oldLease);
+    await store.releaseOwnership(oldLease);
+    const currentLease = await store.acquireOwnership(key, "current-run", 30);
+    assert.ok(currentLease);
+    const filled = { decisionId: accepted.decisionId, intentId: accepted.intentId, clientOrderId: accepted.clientOrderId!, brokerOrderId: "broker-1", status: "FILLED" as const, updatedAt: "2026-09-22T14:00:00.000Z", rawStatus: "filled", lookup: "FOUND" as const };
+    const evidenceCount = store.posts.length;
+    assert.equal(await store.recordBrokerOrder(oldLease, scope, filled), null);
+    assert.equal(store.posts.length, evidenceCount);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "ACCEPTED");
+    await store.putIntent({ ...accepted, status: "PENDING" });
+    assert.equal(await store.claimIntentForDispatch(oldLease, { ...accepted, status: "PENDING" }, scope), false);
+    assert.equal(await store.claimIntentForDispatch(currentLease, { ...accepted, status: "PENDING" }, scope), true);
+    assert.equal(broker.posts, postCount, "a claim alone does not POST an order");
   });
 
   it("bounds trade-stream recovery, reconciles before replacement, and preserves decision/submission idempotency", async () => {

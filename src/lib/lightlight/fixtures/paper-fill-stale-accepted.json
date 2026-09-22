@@ -1,0 +1,22 @@
+{
+  "observedAt": "2026-09-22T14:00:00.000Z",
+  "intentStatus": "ACCEPTED",
+  "brokerOrder": {
+    "brokerOrderId": "broker-1",
+    "status": "FILLED",
+    "rawStatus": "filled",
+    "lookup": "FOUND"
+  },
+  "tradeUpdate": {
+    "stream": "trade_updates",
+    "data": {
+      "event": "fill",
+      "order": {
+        "id": "broker-1",
+        "client_order_id": "__INTENT_CLIENT_ORDER_ID__",
+        "symbol": "SPY",
+        "status": "filled"
+      }
+    }
+  }
+}

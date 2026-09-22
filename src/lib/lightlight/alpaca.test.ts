@@ -285,8 +285,9 @@ describe("Alpaca paper boundaries", () => {
 
   it("models trade updates separately and references the originating intent", () => {
     const state = brokerStateFromTradeUpdate(
-      { stream: "trade_updates", data: { event: "fill", order: { id: "broker-2", status: "filled", client_order_id: intent.intentId } } },
+      { stream: "trade_updates", data: { event: "fill", order: { id: "broker-2", status: "filled", symbol: "SPY", client_order_id: intent.intentId } } },
       intent,
+      "SPY",
     );
     assert.equal(state?.decisionId, intent.decisionId);
     assert.equal(state?.status, "FILLED");
