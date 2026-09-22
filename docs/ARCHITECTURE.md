@@ -294,15 +294,14 @@ A decision can create an execution intent.
 
 An execution engine determines what happens afterward.
 
-Initial engine:
+Current execution modes:
 
-ReplayExecutionEngine
+- `ReplayExecutionEngine` for deterministic historical/replay evaluation;
+- bounded Alpaca PAPER execution for SPY.
 
-Future engine:
-
-PaperBrokerExecutionEngine
-
-No live-money execution belongs in the current architecture.
+The PAPER path is operational and has produced broker fills; it is not a
+live-money path. QQQ/IWM/AAPL/MSFT and BTC/USD remain read-only durable runtimes
+without broker authority.
 
 For the bounded Alpaca PAPER engine, Postgres is also the dispatch-authority
 boundary: exactly one unexpired, fenced lease for the worker key may mark a
@@ -372,25 +371,21 @@ These layers must not be collapsed.
 
 Persistence direction
 
-The browser must eventually become an observer rather than the owner of research state.
+The browser/terminal is an observer of authoritative research and execution
+state rather than the owner of PAPER authority.
 
-Target persistence:
+Current PAPER persistence uses durable Postgres/Neon for worker runs, leases,
+checkpoints, bars, decisions, execution intents, broker-order observations,
+broker-position observations, trade updates, and market-recovery evidence.
 
-SQLite
+Replay/local research may still use local persistence where appropriate, but it
+must not become a second competing execution ledger.
 
-Initial logical tables:
+The next persistence milestone is an immutable `ExperimentRun`/session
+manifest that references the existing durable evidence and records code,
+configuration, strategy, dataset/session, and terminal metric identity.
 
-datasets
-bars
-experiment_runs
-decisions
-jev_calls
-execution_intents
-fills
-positions
-equity
-
-The schema may evolve, but event chronology and provenance must remain explicit.
+Event chronology and provenance must remain explicit.
 
 UI boundary
 
@@ -416,26 +411,27 @@ Current scope
 
 Current:
 
-synthetic replay
-deterministic features
-deterministic strategies
-mock Jev
-policy
-risk
-paper simulation
-interactive terminal
+- deterministic replay and features;
+- deterministic strategies, policy, and risk;
+- mock Jev research boundary;
+- durable SPY Alpaca PAPER execution;
+- 15-minute `ema_trend` and 1-minute `ema_rsi_v1` SPY runtimes;
+- broker-authoritative reconciliation and fill evidence;
+- Postgres lease/fencing authority;
+- live market continuity and verified gap recovery;
+- bounded read-only equity runtimes for QQQ/IWM/AAPL/MSFT;
+- read-only durable BTC/USD market/runtime infrastructure;
+- read-only operational observer.
 
 Near-term:
 
-canonical execution ledger
-causal metrics
-versioned evidence
-durable persistence
-historical market source
-real TypeSafe Jev adapter
-walk-forward evaluation
-live market observation
-paper broker
+- truthful durable worker lifecycle;
+- immutable PAPER experiment-session manifests;
+- live-to-offline replay parity;
+- exact PAPER-compatible execution timing in evaluation;
+- multi-day SPY PAPER soak;
+- repository/main-branch consolidation;
+- controlled strategy experiments with explicit costs/turnover.
 
 Not currently in scope:
 
