@@ -152,10 +152,11 @@ export class SqlAlpacaWorkerStore implements AlpacaWorkerStore {
 
   async updateRun(runId: string, state: string, haltReason: string | null): Promise<void> {
     const sql = await this.sqlProvider();
-    await sql.query(
-      "update worker_runs set state = $2, halt_reason = $3, stopped_at = case when $2 in ('STOPPED', 'HALTED', 'SUPERSEDED') then now() else null end where run_id = $1 and state <> 'SUPERSEDED'",
+    const updated = await sql.query<{ run_id: string }>(
+      "update worker_runs set state = $2, halt_reason = $3, stopped_at = case when $2 in ('STOPPED', 'HALTED', 'SUPERSEDED') then coalesce(stopped_at, now()) else null end where run_id = $1 and $2 <> 'SUPERSEDED' and (state = $2 or state not in ('STOPPED', 'HALTED', 'SUPERSEDED')) returning run_id",
       [runId, state, haltReason],
     );
+    if (updated.length !== 1) throw new Error("WORKER_RUN_LIFECYCLE_UPDATE_REJECTED");
   }
 
   async acquireOwnership(workerKey: string, runId: string, leaseSeconds: number): Promise<WorkerLease | null> {
@@ -419,17 +420,39 @@ export class MemoryAlpacaWorkerStore implements AlpacaWorkerStore {
   private readonly intents = new Map<string, StoredIntent>();
   private readonly checkpoints = new Map<string, WorkerCheckpoint>();
   private readonly leases = new Map<string, WorkerLease>();
-  private readonly runs = new Map<string, { workerKey: string; state: string }>();
+  private readonly runs = new Map<string, { workerKey: string; state: string; haltReason: string | null; stoppedAt: string | null; supersededByRunId: string | null; supersededAt: string | null; supersedeReason: string | null }>();
+  readonly runTransitions: Array<{ runId: string; state: string }> = [];
 
   constructor(durable = true) { this.durable = durable; }
-  async createRun(runId: string, workerKey: string, state: string): Promise<void> { this.runs.set(runId, { workerKey, state }); }
-  async updateRun(runId: string, state: string): Promise<void> { const run = this.runs.get(runId); if (run && run.state !== "SUPERSEDED") run.state = state; }
+  async createRun(runId: string, workerKey: string, state: string): Promise<void> {
+    this.runs.set(runId, { workerKey, state, haltReason: null, stoppedAt: null, supersededByRunId: null, supersededAt: null, supersedeReason: null });
+    this.runTransitions.push({ runId, state });
+  }
+  async updateRun(runId: string, state: string, haltReason: string | null): Promise<void> {
+    const run = this.runs.get(runId);
+    if (!run || state === "SUPERSEDED" || (run.state !== state && ["STOPPED", "HALTED", "SUPERSEDED"].includes(run.state))) throw new Error("WORKER_RUN_LIFECYCLE_UPDATE_REJECTED");
+    run.state = state;
+    run.haltReason = haltReason;
+    if (["STOPPED", "HALTED"].includes(state)) run.stoppedAt ??= nowIso();
+    else run.stoppedAt = null;
+    this.runTransitions.push({ runId, state });
+  }
+  runEvidence(runId: string) { const run = this.runs.get(runId); return run ? clone(run) : null; }
+  allRunEvidence() { return [...this.runs.entries()].map(([runId, run]) => ({ runId, ...clone(run) })); }
+  leaseEvidence(workerKey: string) { const lease = this.leases.get(workerKey); return lease ? clone(lease) : null; }
   async acquireOwnership(workerKey: string, runId: string, leaseSeconds: number): Promise<WorkerLease | null> {
     const prior = this.leases.get(workerKey);
     if (prior && Date.parse(prior.leaseExpiresAt) > Date.now()) return null;
     const lease: WorkerLease = { workerKey, runId, fencingToken: (prior?.fencingToken ?? 0) + 1, leaseExpiresAt: new Date(Date.now() + leaseSeconds * 1000).toISOString() };
     this.leases.set(workerKey, lease);
-    for (const [id, run] of this.runs) if (id !== runId && run.workerKey === workerKey && !["STOPPED", "HALTED", "SUPERSEDED"].includes(run.state)) run.state = "SUPERSEDED";
+    for (const [id, run] of this.runs) if (id !== runId && run.workerKey === workerKey && !["STOPPED", "HALTED", "SUPERSEDED"].includes(run.state)) {
+      run.state = "SUPERSEDED";
+      run.stoppedAt ??= nowIso();
+      run.supersededByRunId = runId;
+      run.supersededAt ??= nowIso();
+      run.supersedeReason ??= "SUPERSEDED_BY_DURABLE_LEASE";
+      this.runTransitions.push({ runId: id, state: "SUPERSEDED" });
+    }
     return clone(lease);
   }
   async renewOwnership(lease: WorkerLease, leaseSeconds: number): Promise<WorkerLease | null> {
