@@ -139,19 +139,24 @@ BTC/USD B0-B3 infrastructure is complete:
 - Alpaca crypto market source;
 - independent durable worker identity/lease/checkpoint/evidence.
 
-BTC remains read-only. Fractional PAPER execution and 24/7 broker recovery are intentionally deferred.
+BTC now has a dedicated continuous read-only operator: `npm run btc:worker -- start`
+and database-only observer: `npm run btc:observe`. It records durable run, lease,
+checkpoint and completed minute-bar evidence, with bounded source reconnect and
+restart recovery. Authority remains `READ_ONLY_DURABLE / MARKET_EVIDENCE_ONLY`,
+with zero broker authority or order submission. The operational bar-age limit is
+three minutes, active 24/7. Historical crypto backfill is unsupported; gaps remain
+visible uncertainty. Stop using SIGINT/SIGTERM. See the
+[BTC soak procedure](BTC_PAPER_RUNTIME.md#24h--72h-soak-procedure).
+
+24h/72h observation soak is pending. The next BTC milestone is PAPER execution
+after soak; fractional execution, broker reconciliation and strategy/cost tuning
+remain outside this slice.
 
 ## Repository state
 
-The current integration work lives on `feat/btc-paper-runtime`, which contains the merged multi-equity runtime and PAPER fill-convergence work. `main` remains behind this integration baseline.
-
-After the current correctness/documentation work is complete:
-
-1. open a final integration PR to `main`;
-2. require green CI;
-3. merge the proven baseline;
-4. delete merged stale branches;
-5. create future tasks from current `main`.
+`main` is the canonical baseline, including merged BTC B0-B3 and worker lifecycle
+persistence. This slice is developed directly from `cd3236f` on
+`feat/btc-24x7-observer` and is submitted to `main` for review.
 
 Do not delete inherited builder/Grok substrate until runtime dependencies have been audited.
 

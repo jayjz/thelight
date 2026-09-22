@@ -6,18 +6,16 @@ const requestedTimeoutMs = Number(process.env.ALPACA_CRYPTO_SMOKE_TIMEOUT_MS ?? 
 const timeoutMs = Number.isFinite(requestedTimeoutMs)
   ? Math.min(120_000, Math.max(1_000, Math.floor(requestedTimeoutMs)))
   : 75_000;
-const [{ loadAlpacaConfig }, { AlpacaCryptoMarketSource }] = await Promise.all([
-  import("../src/lib/lightlight/alpaca.server.ts"),
-  import("../src/lib/lightlight/alpaca-crypto.server.ts"),
-]);
+const { loadAlpacaCryptoCredentials, AlpacaCryptoMarketSource } = await import("../src/lib/lightlight/alpaca-crypto.server.ts");
 
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 async function main() {
-  const config = loadAlpacaConfig();
+  const config = loadAlpacaCryptoCredentials();
   const source = new AlpacaCryptoMarketSource(config);
   const iterator = source.bars()[Symbol.asyncIterator]();
   const nextBar = iterator.next();
+  void nextBar.catch(() => undefined); // Attach before polling startup state.
   const deadline = Date.now() + timeoutMs;
 
   try {

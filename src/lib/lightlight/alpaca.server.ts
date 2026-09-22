@@ -1,3 +1,5 @@
+import { AlpacaTransportError, websocketPayloadToText, type WebSocketFactory } from "./alpaca-transport.ts";
+export { AlpacaTransportError, websocketPayloadToText, type WebSocketFactory, type WebSocketLike } from "./alpaca-transport.ts";
 import type { ClosedBar, ExecutionIntent, ExecutionStatus } from "./types.ts";
 import type { MarketSource } from "./market.ts";
 import { SPY_SPEC, alpacaEquityFeedFor, isBoundedEquitySymbol, type BoundedEquitySymbol } from "./assets.ts";
@@ -21,31 +23,6 @@ export class AlpacaConfigurationError extends Error {
   readonly kind: "MISSING_CREDENTIALS" | "UNSUPPORTED_DATA_FEED" | "INVALID_PAPER_DOMAIN";
   constructor(
     kind: "MISSING_CREDENTIALS" | "UNSUPPORTED_DATA_FEED" | "INVALID_PAPER_DOMAIN",
-    message: string,
-  ) {
-    super(message);
-    this.kind = kind;
-  }
-}
-
-export class AlpacaTransportError extends Error {
-  readonly kind:
-    | "AUTHENTICATION_FAILURE"
-    | "UNSUPPORTED_DATA_FEED"
-    | "DISCONNECTED_STREAM"
-    | "HTTP_FAILURE"
-    | "SUBSCRIPTION_FAILURE"
-    | "PROTOCOL_FAILURE"
-    | "TIMEOUT";
-  constructor(
-    kind:
-      | "AUTHENTICATION_FAILURE"
-      | "UNSUPPORTED_DATA_FEED"
-      | "DISCONNECTED_STREAM"
-      | "HTTP_FAILURE"
-      | "SUBSCRIPTION_FAILURE"
-      | "PROTOCOL_FAILURE"
-      | "TIMEOUT",
     message: string,
   ) {
     super(message);
@@ -212,22 +189,6 @@ export function closedBarFromAlpaca(
     close: message.c,
     volume: message.v,
   };
-}
-
-export type WebSocketLike = {
-  send(payload: string): void;
-  close(): void;
-  addEventListener(type: "open" | "message" | "error" | "close", listener: (event: { data?: unknown }) => void): void;
-};
-
-export type WebSocketFactory = (url: string) => WebSocketLike;
-
-/** Normalizes Node and browser WebSocket message payloads before JSON parsing. */
-export async function websocketPayloadToText(payload: unknown): Promise<string> {
-  if (typeof payload === "string") return payload;
-  if (payload instanceof Blob) return payload.text();
-  if (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload)) return new TextDecoder().decode(payload);
-  throw new TypeError("Unsupported WebSocket payload.");
 }
 
 /** Server-only, IEX-by-default real-time 1Min source. It has no synthetic fallback. */

@@ -231,3 +231,92 @@ describe("Alpaca BTC/USD crypto market-data adapter", () => {
     await pending;
   });
 });
+
+it("rejects bars before subscription acknowledgement and disallows a second consumer", async () => {
+  const socket = new FakeWebSocket();
+  const source = new AlpacaCryptoMarketSource(config, () => socket, () => now);
+  const first = source.bars()[Symbol.asyncIterator]().next();
+  await assert.rejects(source.bars()[Symbol.asyncIterator]().next(), /ALREADY_CONSUMED/);
+  await socket.message(JSON.stringify([minuteBar()]));
+  await assert.rejects(first, /before subscription acknowledgement/);
+});
+
+it("reauthenticates and resubscribes exactly BTC after reconnect; queued old bars are discarded", async () => {
+  const sockets: FakeWebSocket[] = []; const waits: Array<() => void> = [];
+  const source = new AlpacaCryptoMarketSource(config, () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; }, () => now, () => 1, () => new Promise<void>((resolve) => waits.push(resolve)));
+  const iterator = source.bars()[Symbol.asyncIterator](); const first = iterator.next();
+  await authenticateAndSubscribe(sockets[0]!);
+  await sockets[0]!.message(JSON.stringify([minuteBar(), minuteBar({ t: "2026-01-01T00:01:00Z" })]));
+  await first; // consumer pauses with an old-generation bar still queued
+  await sockets[0]!.error(); await sockets[0]!.closeFromServer(); assert.equal(waits.length, 1);
+  waits[0]!(); await new Promise<void>((resolve) => setImmediate(resolve));
+  await authenticateAndSubscribe(sockets[1]!);
+  assert.deepEqual(sockets[1]!.sent.map((payload) => JSON.parse(payload)), [{ action: "auth", key: "key", secret: "secret" }, { action: "subscribe", bars: ["BTC/USD"] }]);
+  const next = iterator.next(); await sockets[0]!.message(JSON.stringify([minuteBar({ c: 90 })]));
+  await sockets[1]!.message(JSON.stringify([minuteBar({ t: "2026-01-01T00:02:00Z" })]));
+  assert.equal((await next).value?.t, Date.parse("2026-01-01T00:02:00Z"));
+  source.close(); await iterator.return?.();
+});
+
+it("bounded exponential retry stops after eight failures and surfaces factory errors", async () => {
+  const { cryptoReconnectDelayMs } = await import("./alpaca-crypto.server.ts");
+  assert.deepEqual([1, 2, 3, 8, 9].map(cryptoReconnectDelayMs), [250, 500, 1000, 30000, 30000]);
+  const sockets: FakeWebSocket[] = []; const waits: Array<() => void> = [];
+  const source = new AlpacaCryptoMarketSource(config, () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; }, () => now, () => 1, () => new Promise<void>((resolve) => waits.push(resolve)));
+  const pending = source.bars()[Symbol.asyncIterator]().next();
+  const rejection = assert.rejects(pending, /budget exhausted/);
+  for (let i = 0; i < 9; i += 1) {
+    await sockets[i]!.error();
+    if (i < 8) { waits[i]!(); await new Promise<void>((resolve) => setImmediate(resolve)); }
+  }
+  await rejection; assert.equal(sockets.length, 9); assert.equal(source.snapshot().state, "FAILED");
+  const broken = new AlpacaCryptoMarketSource(config, () => { throw new Error("factory failed"); });
+  await assert.rejects(broken.bars()[Symbol.asyncIterator]().next(), /factory failed/);
+});
+
+it("terminal auth timeout and entitlement failures never reconnect", async () => {
+  for (const code of [402, 404, 409]) {
+    const socket = new FakeWebSocket(); let retries = 0;
+    const source = new AlpacaCryptoMarketSource(config, () => socket, () => now, () => { retries++; return 1; });
+    const pending = source.bars()[Symbol.asyncIterator]().next();
+    await socket.message(JSON.stringify([{ T: "error", code, msg: "untrusted detail" }]));
+    await assert.rejects(pending, (error: unknown) => error instanceof AlpacaTransportError && error.kind === "AUTHENTICATION_FAILURE");
+    assert.equal(retries, 0); assert.doesNotMatch(source.snapshot().lastError!, /untrusted detail/);
+  }
+});
+
+it("malformed timestamps and unaligned completed bars fail protocol validation", () => {
+  assert.throws(() => closedBarFromAlpacaCrypto(minuteBar({ t: "2026-01-01T00:00:01Z" }), now), /Malformed/);
+  assert.throws(() => closedBarFromAlpacaCrypto(minuteBar({ t: "bad" }), now), /Malformed/);
+});
+
+it("handshake timeout reconnects and graceful close cancels default backoff", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const socket = new FakeWebSocket();
+  const source = new AlpacaCryptoMarketSource(config, () => socket);
+  const pending = source.bars()[Symbol.asyncIterator]().next();
+  context.mock.timers.tick(10_000);
+  assert.equal(source.snapshot().state, "RECONNECTING");
+  assert.equal(source.snapshot().reconnectAttempt, 1);
+  source.close(); await pending;
+  context.mock.timers.tick(30_000);
+  assert.equal(source.snapshot().state, "CLOSED");
+});
+
+it("an old unresolved payload cannot block a new generation's authentication", async () => {
+  const sockets: FakeWebSocket[] = []; const waits: Array<() => void> = [];
+  const source = new AlpacaCryptoMarketSource(config, () => { const socket = new FakeWebSocket(); sockets.push(socket); return socket; }, () => now, () => 1, () => new Promise<void>((resolve) => waits.push(resolve)));
+  const iterator = source.bars()[Symbol.asyncIterator](); const pending = iterator.next();
+  await authenticateAndSubscribe(sockets[0]!);
+  let finish!: (value: string) => void;
+  const payload = new Blob(); payload.text = () => new Promise<string>((resolve) => { finish = resolve; });
+  const oldMessage = sockets[0]!.message(payload);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await sockets[0]!.error(); waits[0]!();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await authenticateAndSubscribe(sockets[1]!);
+  await sockets[1]!.message(JSON.stringify([minuteBar()]));
+  assert.equal((await pending).value?.close, 101);
+  finish(JSON.stringify([minuteBar({ c: 90 })])); await oldMessage;
+  source.close(); await iterator.return?.();
+});

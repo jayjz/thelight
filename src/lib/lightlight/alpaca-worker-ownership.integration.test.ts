@@ -4,6 +4,9 @@ import { after, before, describe, it } from "node:test";
 import pg from "pg";
 import type { Sql } from "../db.ts";
 import { SqlAlpacaWorkerStore } from "./alpaca-worker-store.server.ts";
+import { DurableMarketWorker } from "./durable-market-worker.server.ts";
+import { BTC_USD_RUNTIME_IDENTITY, assertReadOnlyDurable } from "./runtime-identity.ts";
+import { loadBtcObserverSnapshot } from "./btc-observe.ts";
 import type { ExecutionIntent } from "./types.ts";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -77,11 +80,46 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
     // delete general worker evidence from the shared Neon database.
     await cleanup.query("delete from worker_leases where worker_key like $1", [`${scope}%`]);
     await cleanup.query("delete from runtime_checkpoint where worker_key like $1", [`${scope}%`]);
+    await cleanup.query("delete from market_bar_observations where symbol like $1", [`${scope}%`]);
     await cleanup.query("delete from closed_bars where symbol like $1", [`${scope}%`]);
     await cleanup.query("delete from execution_intents where intent_id like $1", [`${scope}%`]);
     await cleanup.query("delete from decisions where decision_id like $1", [`${scope}%`]);
-    await cleanup.query("delete from worker_runs where run_id like $1", [`${scope}%`]);
+    await cleanup.query("delete from worker_runs where run_id like $1 or worker_key like $1", [`${scope}%`]);
     await Promise.all([clientA.end(), clientB.end(), cleanup.end()]);
+  });
+
+  it("runs the BTC durable lifecycle and database-only observer across restart on Postgres", async () => {
+    const identity = { ...BTC_USD_RUNTIME_IDENTITY, workerKey: `${scope}:btc-runtime`, asset: { ...BTC_USD_RUNTIME_IDENTITY.asset, symbol: `${scope}:runtime:BTC/USD` } };
+    assertReadOnlyDurable(identity);
+    const a = new DurableMarketWorker({ identity, store: storeA });
+    const b = new DurableMarketWorker({ identity, store: storeB });
+    const bar = { t: 1_726_000_020_000, open: 100, high: 102, low: 99, close: 101, volume: 2 };
+    try {
+      await a.start(); assert.equal(a.snapshot().state, "READY");
+      await a.processClosedBar(bar); await a.processClosedBar(bar);
+      await a.stop();
+      const oldRun = await cleanup.query("select state, stopped_at from worker_runs where run_id = $1", [a.snapshot().runId]);
+      assert.equal(oldRun.rows[0].state, "STOPPED"); assert.ok(oldRun.rows[0].stopped_at);
+      await b.start(); assert.equal(b.snapshot().state, "READY");
+      assert.notEqual(a.snapshot().runId, b.snapshot().runId);
+      assert.equal(b.snapshot().recoveredClosedBarCount, 1);
+      assert.equal(b.snapshot().latestRawBarTimestamp, bar.t);
+      assert.equal((await storeB.listClosedBars(identity.asset.symbol)).length, 1);
+      await cleanup.query("BEGIN READ ONLY");
+      try {
+        const snapshot = await loadBtcObserverSnapshot({ query: async <T extends Record<string, unknown>>(text: string) => {
+          const result = await cleanup.query(text, [identity.workerKey, identity.asset.symbol]);
+          return { rows: result.rows as T[] };
+        } });
+        assert.equal(snapshot.runId, b.snapshot().runId);
+        assert.equal(snapshot.leaseLive, true);
+        assert.equal(snapshot.brokerAuthority, "NONE");
+        assert.equal(snapshot.runtimeCapability, "READ_ONLY_DURABLE");
+        assert.equal(snapshot.checkpointCaughtUp, true);
+        await cleanup.query("COMMIT");
+      } catch (error) { await cleanup.query("ROLLBACK"); throw error; }
+      assert.deepEqual((await cleanup.query("select state, stopped_at from worker_runs where run_id = $1", [a.snapshot().runId])).rows, oldRun.rows);
+    } finally { await a.stop(); await b.stop(); }
   });
 
   it("has the migrated lease primary key and fencing/run evidence columns", async () => {

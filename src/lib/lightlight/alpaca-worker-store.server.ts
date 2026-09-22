@@ -3,7 +3,11 @@ import type { Sql } from "../db.ts";
 import type { BrokerOrderState, BrokerPositionSnapshot } from "./alpaca.server.ts";
 import type { ClosedBar, Evidence, ExecutionIntent, ExecutionStatus } from "./types.ts";
 
+import type { DurableMarketEvidence } from "./durable-market-worker.server.ts";
+
 export type WorkerCheckpoint = {
+  /** Read-only market runtime evidence, absent on existing execution checkpoints. */
+  marketEvidence?: DurableMarketEvidence;
   latestRawBarTimestamp: number | null;
   latestClosedDecisionBarTimestamp: number | null;
   latestDecisionId: string | null;
