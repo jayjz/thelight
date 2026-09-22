@@ -306,6 +306,7 @@ export class AlpacaPaperWorker {
       return;
     }
     await this.options.store.createRun(this.runId, this.key, this.state);
+    if (this.stopped) return;
     const ownership = await this.options.store.acquireOwnership(this.key, this.runId, OWNERSHIP_LEASE_SECONDS);
     if (!ownership) {
       // A live process already owns the durable lease. Do not write the shared
@@ -318,6 +319,10 @@ export class AlpacaPaperWorker {
       return;
     }
     this.ownership = ownership;
+    if (this.stopped) {
+      await this.releaseOwnership();
+      return;
+    }
     this.ownershipGeneration += 1;
     this.startOwnershipRenewal();
     const storedCheckpoint = await this.options.store.readCheckpoint(this.key);
@@ -326,23 +331,34 @@ export class AlpacaPaperWorker {
     this.checkpoint = this.normalizeCheckpoint(storedCheckpoint ?? emptyCheckpoint());
       this.marketStreamState = this.checkpoint.marketStreamState;
       this.tradeUpdateStreamState = this.checkpoint.tradeUpdateStreamState;
+    if (this.stopped) {
+      await this.releaseOwnership();
+      return;
+    }
     try {
       if (this.dispatchCapable) await this.reconcileInternal();
+      if (this.stopped) return;
       // A process may inherit durable raw bars that were recorded before it
       // started. Repair only the bounded feature horizon before this run can
       // create any new dispatch-eligible work.
       await this.recoverStartupFeatureGaps();
+      if (this.stopped) return;
+      if (!await this.confirmCurrentOwnership()) return;
       this.state = "READY";
       await this.persistCheckpoint();
+      await this.options.store.updateRun(this.runId, this.state, null);
+      if (!await this.confirmCurrentOwnership()) return;
       if (this.dispatchCapable) this.connectTradeUpdates();
       this.startMarketConsumer();
     } catch (error) {
+      if (this.stopped) return;
       await this.halt(error instanceof Error ? error.message : "STARTUP_RECONCILIATION_FAILED");
     }
   }
 
   async stop(): Promise<void> {
     const owned = this.ownership !== null;
+    const wasHalted = this.state === "HALTED";
     this.stopped = true;
     this.stopOwnershipRenewal();
     this.reconnectGeneration += 1;
@@ -352,10 +368,21 @@ export class AlpacaPaperWorker {
     this.disconnectTradeUpdates = null;
     this.marketStreamState = "DISCONNECTED";
     this.tradeUpdateStreamState = "DISCONNECTED";
-    this.state = "STOPPED";
-    if (owned) await this.persistCheckpoint();
-    if (this.runId) await this.options.store.updateRun(this.runId, this.state, null);
-    await this.releaseOwnership();
+    if (!wasHalted) this.state = "STOPPED";
+    try {
+      let mayPersistCheckpoint = true;
+      if (this.runId && !wasHalted) {
+        try {
+          await this.options.store.updateRun(this.runId, this.state, null);
+        } catch (error) {
+          if (!this.isLifecycleUpdateRejected(error)) throw error;
+          mayPersistCheckpoint = false;
+        }
+      }
+      if (owned && mayPersistCheckpoint) await this.persistCheckpoint();
+    } finally {
+      await this.releaseOwnership();
+    }
   }
 
   /** Server/CLI operator control. It never authorizes unknown resubmission. */
@@ -364,9 +391,12 @@ export class AlpacaPaperWorker {
     try {
       if (!this.dispatchCapable) return;
       await this.reconcileInternal();
+      if (this.stopped) return;
       this.state = "READY";
       await this.persistCheckpoint();
+      await this.options.store.updateRun(this.runId!, this.state, null);
     } catch (error) {
+      if (this.stopped) return;
       await this.halt(error instanceof Error ? error.message : "RECONCILIATION_FAILED");
     }
   }
@@ -763,8 +793,20 @@ export class AlpacaPaperWorker {
 
   private async reconcileInternal(): Promise<void> {
     this.state = "RECONCILING";
+    if (!this.runId) throw new Error("WORKER_RUN_REQUIRED");
+    try {
+      await this.options.store.updateRun(this.runId, this.state, null);
+    } catch (error) {
+      if (this.isLifecycleUpdateRejected(error)) {
+        await this.loseOwnership("DISPATCH_OWNERSHIP_LOST");
+        return;
+      }
+      throw error;
+    }
     await this.refreshPaperEquity();
+    if (this.stopped) return;
     const position = await this.broker().position();
+    if (this.stopped) return;
     if (position.symbol !== this.asset.symbol || position.provenance !== "ALPACA_RECONCILED" || !Number.isFinite(position.quantity)) throw new Error("BROKER_POSITION_RECONCILIATION_REQUIRED");
     this.brokerPosition = position;
     await this.options.store.appendBrokerPosition(position);
@@ -1030,7 +1072,13 @@ export class AlpacaPaperWorker {
     this.tradeUpdateStreamState = "DEGRADED";
     this.checkpoint.haltReason = reason;
     // Deliberately no checkpoint mutation after authority is lost.
-    if (this.runId) await this.options.store.updateRun(this.runId, this.state, reason);
+    if (this.runId) {
+      try {
+        await this.options.store.updateRun(this.runId, this.state, reason);
+      } catch (error) {
+        if (!this.isLifecycleUpdateRejected(error)) throw error;
+      }
+    }
   }
 
   private async halt(reason: string): Promise<void> {
@@ -1046,9 +1094,36 @@ export class AlpacaPaperWorker {
     this.checkpoint.haltReason = reason;
     this.marketStreamState = "DEGRADED";
     this.tradeUpdateStreamState = "DEGRADED";
-    await this.persistCheckpoint();
-    if (this.runId) await this.options.store.updateRun(this.runId, this.state, reason);
-    await this.releaseOwnership();
+    try {
+      let lifecyclePersisted = true;
+      if (this.runId) {
+        try {
+          await this.options.store.updateRun(this.runId, this.state, reason);
+        } catch (error) {
+          if (!this.isLifecycleUpdateRejected(error)) throw error;
+          lifecyclePersisted = false;
+        }
+      }
+      if (lifecyclePersisted) await this.persistCheckpoint();
+    } finally {
+      await this.releaseOwnership();
+    }
+  }
+
+  private async confirmCurrentOwnership(): Promise<boolean> {
+    const ownership = this.ownership;
+    if (!ownership || this.stopped) return false;
+    const renewed = await this.options.store.renewOwnership(ownership, OWNERSHIP_LEASE_SECONDS);
+    if (!renewed) {
+      await this.loseOwnership("DISPATCH_OWNERSHIP_LOST");
+      return false;
+    }
+    this.ownership = renewed;
+    return true;
+  }
+
+  private isLifecycleUpdateRejected(error: unknown): boolean {
+    return error instanceof Error && error.message === "WORKER_RUN_LIFECYCLE_UPDATE_REJECTED";
   }
 
   private async persistCheckpoint(): Promise<void> {

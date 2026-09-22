@@ -224,6 +224,39 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
     assert.equal(evidence.rowCount, 1);
   });
 
+  it("persists lifecycle updates while refusing to reopen a superseded predecessor", async () => {
+    const key = `${scope}:lifecycle`;
+    const runA = `${scope}:lifecycle:a`;
+    const runB = `${scope}:lifecycle:b`;
+    await storeA.createRun(runA, key, "STARTING");
+    const leaseA = await storeA.acquireOwnership(key, runA, 30);
+    assert.ok(leaseA);
+    await storeA.updateRun(runA, "RECONCILING", null);
+    await storeA.updateRun(runA, "READY", null);
+    const beforeTakeover = await cleanup.query<{ state: string; stopped_at: string | null }>("select state, stopped_at from worker_runs where run_id = $1", [runA]);
+    assert.deepEqual(beforeTakeover.rows[0], { state: "READY", stopped_at: null });
+
+    await storeA.releaseOwnership(leaseA);
+    await storeB.createRun(runB, key, "STARTING");
+    const leaseB = await storeB.acquireOwnership(key, runB, 30);
+    assert.ok(leaseB);
+    const superseded = await cleanup.query<{ state: string; stopped_at: string | null; superseded_by_run_id: string; superseded_at: string | null; supersede_reason: string }>(
+      "select state, stopped_at, superseded_by_run_id, superseded_at, supersede_reason from worker_runs where run_id = $1", [runA],
+    );
+    assert.equal(superseded.rows[0]?.state, "SUPERSEDED");
+    assert.ok(superseded.rows[0]?.stopped_at && superseded.rows[0]?.superseded_at);
+    assert.equal(superseded.rows[0]?.superseded_by_run_id, runB);
+    assert.equal(superseded.rows[0]?.supersede_reason, "SUPERSEDED_BY_DURABLE_LEASE");
+    for (const state of ["READY", "RECONCILING", "STOPPED"]) {
+      await assert.rejects(() => storeA.updateRun(runA, state, null), /WORKER_RUN_LIFECYCLE_UPDATE_REJECTED/);
+    }
+    const afterStaleWrites = await cleanup.query<{ state: string }>("select state from worker_runs where run_id = $1", [runA]);
+    assert.equal(afterStaleWrites.rows[0]?.state, "SUPERSEDED");
+    const ownerAfterStaleWrites = await cleanup.query<{ owner_run_id: string; fencing_token: number }>("select owner_run_id, fencing_token from worker_leases where worker_key = $1", [key]);
+    assert.equal(ownerAfterStaleWrites.rows[0]?.owner_run_id, runB, "stale lifecycle writes do not alter the owner");
+    assert.equal(Number(ownerAfterStaleWrites.rows[0]?.fencing_token), leaseB.fencingToken, "stale lifecycle writes do not alter the fencing token");
+  });
+
   it("fails closed on an unavailable ownership validation and releases gracefully", async () => {
     const key = `${scope}:release`; const runA = `${scope}:release:a`; const runB = `${scope}:release:b`;
     const value = intent(`${scope}:release`);
