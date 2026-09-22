@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Sql } from "../db.ts";
 import type { BrokerOrderState, BrokerPositionSnapshot } from "./alpaca.server.ts";
-import type { ClosedBar, Evidence, ExecutionIntent } from "./types.ts";
+import type { ClosedBar, Evidence, ExecutionIntent, ExecutionStatus } from "./types.ts";
 
 export type WorkerCheckpoint = {
   latestRawBarTimestamp: number | null;
@@ -101,7 +101,8 @@ export interface AlpacaWorkerStore {
   persistDecisionAndIntent(workerKey: string, evidence: Evidence, intent: ExecutionIntent, dispatchBlockReason?: string | null): Promise<{ inserted: boolean }>;
   putIntent(intent: ExecutionIntent, dispatchBlockReason?: string | null): Promise<void>;
   listIntents(symbol?: string, workerKey?: string): Promise<StoredIntent[]>;
-  appendBrokerOrder(state: BrokerOrderState): Promise<void>;
+  /** Append broker evidence and advance its fenced intent projection atomically. */
+  recordBrokerOrder(lease: WorkerLease, scope: DurableWorkerScope, state: BrokerOrderState, dispatchBlockReason?: string | null): Promise<ExecutionStatus | null>;
   latestBrokerOrder(intentId: string): Promise<BrokerOrderState | null>;
   appendBrokerPosition(position: BrokerPositionSnapshot): Promise<void>;
   appendTradeUpdate(update: Record<string, unknown>, clientOrderId: string | null): Promise<void>;
@@ -113,6 +114,20 @@ export interface AlpacaWorkerStore {
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const nowIso = () => new Date().toISOString();
+const terminalStatus = (status: ExecutionStatus) => status === "FILLED" || status === "REJECTED" || status === "CANCELLED";
+
+function projectedBrokerStatus(current: ExecutionStatus, state: BrokerOrderState): ExecutionStatus {
+  if (terminalStatus(current)) return current;
+  // submit() returns this exact absent state when the reconciled position
+  // already matches the target and no order was sent.
+  if (state.lookup === "ABSENT") return current === "SUBMISSION_ATTEMPTED" && state.status === "CANCELLED" && !state.brokerOrderId && !state.rawStatus ? "CANCELLED" : current;
+  if (state.status === "UNKNOWN") return current === "ACCEPTED" || current === "PARTIALLY_FILLED" ? current : "UNKNOWN";
+  if (state.status === "PENDING" || state.status === "SUBMISSION_ATTEMPTED") return current;
+  if (state.lookup !== "FOUND" && state.status !== "REJECTED" && state.status !== "CANCELLED") return current;
+  if (state.lookup !== "FOUND" && (current === "ACCEPTED" || current === "PARTIALLY_FILLED")) return current;
+  if (state.status === "ACCEPTED" && current === "PARTIALLY_FILLED") return current;
+  return state.status;
+}
 async function getWorkerSql(): Promise<Sql> {
   const { getSql } = await import("../db.ts");
   return getSql();
@@ -312,12 +327,39 @@ export class SqlAlpacaWorkerStore implements AlpacaWorkerStore {
     return rows.map((row) => ({ intent: JSON.parse(row.intent_json) as ExecutionIntent, dispatchBlockReason: row.dispatch_block_reason }));
   }
 
-  async appendBrokerOrder(state: BrokerOrderState): Promise<void> {
+  async recordBrokerOrder(lease: WorkerLease, scope: DurableWorkerScope, state: BrokerOrderState, dispatchBlockReason: string | null = null): Promise<ExecutionStatus | null> {
+    if (lease.workerKey !== scope.workerKey) return null;
     const sql = await this.sqlProvider();
-    await sql.query(
-      "insert into broker_orders (event_id, intent_id, client_order_id, broker_order_id, status, lookup_state, raw_status, observed_at, state_json) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-      [randomUUID(), state.intentId, state.clientOrderId, state.brokerOrderId, state.status, state.lookup, state.rawStatus, state.updatedAt ?? nowIso(), JSON.stringify(state)],
-    );
+    return sql.transaction(async (tx) => {
+      const held = await tx.query<{ worker_key: string }>(
+        "select worker_key from worker_leases where worker_key = $1 and owner_run_id = $2 and fencing_token = $3 and lease_expires_at > clock_timestamp() for update",
+        [lease.workerKey, lease.runId, lease.fencingToken],
+      );
+      if (!held[0]) return null;
+      const rows = await tx.query<{ status: ExecutionStatus; intent_json: string }>(
+        "select i.status, i.intent_json from execution_intents i join decisions d on d.decision_id = i.decision_id where i.intent_id = $1 and i.decision_id = $2 and i.client_order_id = $3 and d.symbol = $4 and (d.worker_key = $5 or d.worker_key is null) for update of i",
+        [state.intentId, state.decisionId, state.clientOrderId, scope.asset.symbol, scope.workerKey],
+      );
+      if (!rows[0]) return null;
+      const prior = await tx.query<{ broker_order_id: string | null }>(
+        "select broker_order_id from broker_orders where intent_id = $1 and broker_order_id is not null order by observed_at desc, event_id desc limit 1",
+        [state.intentId],
+      );
+      if (state.brokerOrderId && prior[0]?.broker_order_id && prior[0].broker_order_id !== state.brokerOrderId) return null;
+      await tx.query(
+        "insert into broker_orders (event_id, intent_id, client_order_id, broker_order_id, status, lookup_state, raw_status, observed_at, state_json) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        [randomUUID(), state.intentId, state.clientOrderId, state.brokerOrderId, state.status, state.lookup, state.rawStatus, state.updatedAt ?? nowIso(), JSON.stringify(state)],
+      );
+      const status = projectedBrokerStatus(rows[0].status, state);
+      if (status !== rows[0].status) {
+        const intent = JSON.parse(rows[0].intent_json) as ExecutionIntent;
+        await tx.query(
+          "update execution_intents set status = $2, intent_json = $3, dispatch_block_reason = $4, updated_at = now() where intent_id = $1",
+          [state.intentId, status, JSON.stringify({ ...intent, status }), dispatchBlockReason],
+        );
+      }
+      return status;
+    });
   }
 
   async latestBrokerOrder(intentId: string): Promise<BrokerOrderState | null> {
@@ -463,7 +505,22 @@ export class MemoryAlpacaWorkerStore implements AlpacaWorkerStore {
       .filter((stored) => (!symbol || this.decisions.get(stored.intent.decisionId)?.symbol === symbol) && (!workerKey || this.decisionWorkerKeys.get(stored.intent.decisionId) === workerKey))
       .map(clone);
   }
-  async appendBrokerOrder(state: BrokerOrderState): Promise<void> { this.posts.push(clone(state)); }
+  async recordBrokerOrder(lease: WorkerLease, scope: DurableWorkerScope, state: BrokerOrderState, dispatchBlockReason: string | null = null): Promise<ExecutionStatus | null> {
+    const current = this.leases.get(lease.workerKey);
+    const stored = this.intents.get(state.intentId);
+    if (lease.workerKey !== scope.workerKey || !current || current.runId !== lease.runId || current.fencingToken !== lease.fencingToken || Date.parse(current.leaseExpiresAt) <= Date.now() ||
+      !stored || stored.intent.decisionId !== state.decisionId || (stored.intent.clientOrderId ?? stored.intent.intentId) !== state.clientOrderId ||
+      this.decisions.get(state.decisionId)?.symbol !== scope.asset.symbol || this.decisionWorkerKeys.get(state.decisionId) !== scope.workerKey) return null;
+    const prior = [...this.posts].reverse().find((order) => order.intentId === state.intentId && order.brokerOrderId);
+    if (state.brokerOrderId && prior?.brokerOrderId && prior.brokerOrderId !== state.brokerOrderId) return null;
+    this.posts.push(clone(state));
+    const status = projectedBrokerStatus(stored.intent.status, state);
+    if (status !== stored.intent.status) {
+      stored.intent = { ...stored.intent, status };
+      stored.dispatchBlockReason = dispatchBlockReason;
+    }
+    return status;
+  }
   async latestBrokerOrder(intentId: string): Promise<BrokerOrderState | null> {
     return clone([...this.posts].reverse().find((state) => state.intentId === intentId) ?? null);
   }

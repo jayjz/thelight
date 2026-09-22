@@ -455,19 +455,28 @@ export class AlpacaPaperBroker {
 export function brokerStateFromTradeUpdate(
   update: Record<string, unknown>,
   intent: ExecutionIntent,
+  symbol: string,
 ): BrokerOrderState | null {
   if (update.stream !== "trade_updates") return null;
   const data = update.data as Record<string, unknown> | undefined;
   const order = data?.order as Record<string, unknown> | undefined;
-  if (!order) return null;
-  const clientOrderId = String(order.client_order_id ?? "");
-  if (clientOrderId !== (intent.clientOrderId ?? intent.intentId)) return null;
+  if (!order || typeof order !== "object" || Array.isArray(order)) return null;
+  const clientOrderId = order.client_order_id;
+  if (typeof clientOrderId !== "string" || clientOrderId !== (intent.clientOrderId ?? intent.intentId) ||
+    order.symbol !== symbol || typeof order.id !== "string" || !order.id) return null;
+  const eventStatus: Record<string, ExecutionStatus> = {
+    accepted: "ACCEPTED", pending_new: "ACCEPTED", new: "ACCEPTED", accepted_for_bidding: "ACCEPTED",
+    partial_fill: "PARTIALLY_FILLED", fill: "FILLED",
+    canceled: "CANCELLED", rejected: "REJECTED", expired: "CANCELLED", done_for_day: "CANCELLED",
+  };
+  const status = typeof data?.event === "string" ? eventStatus[data.event] : undefined;
+  if (!status) return null;
   return {
     decisionId: intent.decisionId,
     intentId: intent.intentId,
     clientOrderId,
-    brokerOrderId: String(order.id ?? "") || null,
-    status: orderStatus(order),
+    brokerOrderId: order.id,
+    status,
     updatedAt: String(order.updated_at ?? "") || null,
     rawStatus: String(order.status ?? data?.event ?? "") || null,
     lookup: "FOUND",

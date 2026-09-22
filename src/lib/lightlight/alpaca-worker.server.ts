@@ -731,7 +731,7 @@ export class AlpacaPaperWorker {
       return;
     }
     const reconciled = await this.broker().reconcile(intent);
-    await this.recordBrokerState(intent, reconciled);
+    await this.recordBrokerState(reconciled);
     if (reconciled.lookup === "FOUND" || reconciled.status === "UNKNOWN" || reconciled.status !== "PENDING") return;
     const ownership = this.ownership;
     if (!ownership) throw new Error("DISPATCH_OWNERSHIP_REQUIRED");
@@ -757,7 +757,7 @@ export class AlpacaPaperWorker {
       await this.loseOwnership("DISPATCH_OWNERSHIP_LOST");
       throw new Error("DISPATCH_OWNERSHIP_LOST");
     }
-    await this.recordBrokerState(intent, submitted);
+    await this.recordBrokerState(submitted);
     if (submitted.status === "UNKNOWN") await this.halt("UNKNOWN_SUBMISSION_REQUIRES_RECOVERY");
   }
 
@@ -782,7 +782,7 @@ export class AlpacaPaperWorker {
       if (stored.intent.status === "SUBMISSION_ATTEMPTED" && state.lookup === "ABSENT") {
         throw new Error("SUBMISSION_ATTEMPTED_RECOVERY_REQUIRED");
       }
-      await this.recordBrokerState(stored.intent, state, stored.dispatchBlockReason);
+      await this.recordBrokerState(state, stored.dispatchBlockReason);
       // UNKNOWN + ABSENT remains UNKNOWN. It is intentionally never submitted here.
       if (state.status === "UNKNOWN") throw new Error("UNKNOWN_SUBMISSION_REQUIRES_RECOVERY");
       // A crash after atomic persistence but before dispatch leaves PENDING.
@@ -795,11 +795,12 @@ export class AlpacaPaperWorker {
     this.checkpoint.haltReason = null;
   }
 
-  private async recordBrokerState(intent: ExecutionIntent, state: BrokerOrderState, blockReason: string | null = null): Promise<void> {
-    const updated = { ...intent, status: state.status, clientOrderId: state.clientOrderId };
-    this.latestBrokerOrderState = state.status;
-    await this.options.store.putIntent(updated, blockReason);
-    await this.options.store.appendBrokerOrder(state);
+  private async recordBrokerState(state: BrokerOrderState, blockReason: string | null = null): Promise<void> {
+    const ownership = this.ownership;
+    if (!ownership) throw new Error("DISPATCH_OWNERSHIP_REQUIRED");
+    const projected = await this.options.store.recordBrokerOrder(ownership, this.runtimeIdentity, state, blockReason);
+    if (projected === null) throw new Error("BROKER_ORDER_OWNERSHIP_OR_CORRELATION_LOST");
+    this.latestBrokerOrderState = projected;
   }
 
   private connectTradeUpdates(): void {
@@ -808,7 +809,7 @@ export class AlpacaPaperWorker {
     const generation = this.reconnectGeneration;
     let failedDuringConnect = false;
     const disconnect = this.options.tradeUpdates.connect(
-      (update) => { void this.processTradeUpdate(update); },
+      (update) => { void this.processTradeUpdate(update).catch((error) => this.halt(error instanceof Error ? error.message : "TRADE_UPDATE_PROJECTION_FAILED")); },
       (error) => {
         failedDuringConnect = true;
         void this.handleTradeStreamError(error);
@@ -835,11 +836,12 @@ export class AlpacaPaperWorker {
     const clientOrderId = order ? String(order.client_order_id ?? "") || null : null;
     await this.options.store.appendTradeUpdate(update, clientOrderId);
     this.lastTradeUpdateTimestamp = (this.options.now ?? (() => new Date()))().toISOString();
+    if (!this.ownership || this.stopped || this.state === "HALTED") return;
     if (!clientOrderId) return this.persistCheckpoint();
     const stored = (await this.options.store.listIntents(this.asset.symbol, this.key)).find(({ intent }) => (intent.clientOrderId ?? intent.intentId) === clientOrderId);
     if (stored) {
-      const state = brokerStateFromTradeUpdate(update, stored.intent);
-      if (state) await this.recordBrokerState(stored.intent, state, stored.dispatchBlockReason);
+      const state = brokerStateFromTradeUpdate(update, stored.intent, this.asset.symbol);
+      if (state) await this.recordBrokerState(state, stored.dispatchBlockReason);
     }
     await this.persistCheckpoint();
   }

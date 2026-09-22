@@ -64,6 +64,8 @@ test("the auth schema ships outside the globbed directory", () => {
     { name: "0004_alpaca_paper_worker_ownership.sql", path: "0004_alpaca_paper_worker_ownership.sql" },
     { name: "0005_alpaca_paper_worker_legacy_run_key.sql", path: "0005_alpaca_paper_worker_legacy_run_key.sql" },
     { name: "0006_alpaca_paper_market_recovery.sql", path: "0006_alpaca_paper_market_recovery.sql" },
+    { name: "0007_ema_rsi_v1_worker_arm.sql", path: "0007_ema_rsi_v1_worker_arm.sql" },
+    { name: "0008_ema_rsi_v1_legacy_evidence_compat.sql", path: "0008_ema_rsi_v1_legacy_evidence_compat.sql" },
   ]);
   assert.ok(readdirSync(join(migrationsDir, "auth")).includes("0001_auth.sql"));
 });
