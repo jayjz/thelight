@@ -1,44 +1,54 @@
 # LIGHTLIGHT
 
-LIGHTLIGHT (thelight) is an evidence-driven quantitative research system with a
-bounded Alpaca PAPER execution worker. It is designed to make market research
-inspectable and reproducible, not to make performance claims or provide a
-live-trading path.
+LIGHTLIGHT (`thelight`) is an evidence-driven quantitative research system with a bounded Alpaca PAPER execution runtime. Its purpose is to make strategy research, decision state, broker execution, and recovery inspectable and reproducible. It is not a profitability claim and it has no live-money execution path.
 
 ## Research thesis
 
-Deterministic quantitative signals should remain independently reproducible.
-Typed model outputs may assist regime classification or strategy gating, while
-the deterministic system retains decision, risk, and execution authority.
+Deterministic quantitative signals should remain independently reproducible. Typed model outputs may assist regime classification or strategy gating, while deterministic code retains decision, risk, sizing, and execution authority.
 
 ```text
 market data
   -> deterministic features
   -> candidate strategy
-  -> typed classification
-  -> deterministic router
+  -> optional typed classification
+  -> deterministic policy
   -> deterministic risk
   -> PAPER execution
   -> durable evidence
+  -> independent evaluation
 ```
 
-The model does **not** calculate indicators, position sizing, or P&L, and it
-does not receive independent free-form BUY/SELL authority. Its input and typed
-response are retained as evidence alongside the deterministic decision path.
+The model does **not** calculate indicators, position sizing, P&L, or broker authority, and it does not receive free-form BUY/SELL control.
 
-## Current scope and safety boundaries
+## Current runtime status
 
-- The worker is PAPER-only, single-symbol (`SPY`), and derives decisions from
-  closed 1-minute bars aggregated into completed 15-minute buckets.
-- Causal timing is a core invariant: a decision can use only information
-  available at its timestamp and cannot receive exposure to an already-known
-  return.
-- Durable Neon/Postgres evidence records decision inputs, intent, broker
-  observations, and reconciliation history. Broker account, position, and open
-  order state are authoritative before dispatch.
-- `UNKNOWN` and `SUBMISSION_ATTEMPTED` states fail closed. A restart reconciles
-  the deterministic client-order identity; it never treats uncertainty or an
-  absent lookup as permission to submit again.
+The repository now contains both a research plane and a PAPER execution plane.
+
+| Runtime | Market data | Strategy | Authority |
+| --- | --- | --- | --- |
+| SPY / 15Min | Alpaca IEX via the bounded market path | `ema_trend` / Arm C | PAPER dispatch capable |
+| SPY / 1Min | Alpaca IEX via the bounded market path | `ema_rsi_v1` | PAPER dispatch capable |
+| QQQ / 1Min | bounded equity runtime | `ema_rsi_v1` | read-only durable evidence |
+| IWM / 1Min | bounded equity runtime | `ema_rsi_v1` | read-only durable evidence |
+| AAPL / 1Min | bounded equity runtime | `ema_rsi_v1` | read-only durable evidence |
+| MSFT / 1Min | bounded equity runtime | `ema_rsi_v1` | read-only durable evidence |
+| BTC/USD | Alpaca crypto market data | runtime/evidence foundation | read-only durable evidence |
+
+Only SPY currently has broker dispatch authority. Multi-equity and BTC capability boundaries are intentionally narrower than their market-data/evidence capabilities.
+
+The September 22, 2026 SPY PAPER session exercised the live path through closed bars, deterministic decisions, fenced dispatch, Alpaca PAPER fills, broker reconciliation, trade updates, position observations, and durable Postgres evidence. That run is evidence that the execution harness operates end-to-end; it is **not** evidence that the current strategy has positive expectancy.
+
+## Safety boundaries
+
+- PAPER only. No live-money Alpaca domain is supported.
+- Broker account, position, open orders, and broker order state are authoritative for execution truth.
+- Dispatch is single-owner across processes through a Postgres lease and monotonic fencing token.
+- `UNKNOWN` and `SUBMISSION_ATTEMPTED` recovery fail closed; uncertainty never authorizes a retry.
+- Alpaca `trade_updates` are retained as durable evidence and correlated to deterministic client-order identities.
+- Terminal intent projection is monotonic: a confirmed fill cannot be regressed by a delayed nonterminal broker observation.
+- Market-data gaps invalidate continuity and must be recovered and verified before dispatch resumes.
+- Vercel serves the web boundary only; it never owns the long-lived PAPER worker.
+- Non-SPY runtimes do not receive broker authority merely because they can persist market evidence.
 
 ## Local setup
 
@@ -50,11 +60,9 @@ cp .env.example .env
 npm run dev
 ```
 
-Keep credentials in the untracked `.env` file. `DATABASE_URL` is required for
-the durable PAPER worker to receive dispatch authority; without it, the worker
-halts before it can submit an order.
+Keep credentials in the untracked `.env`. A durable `DATABASE_URL` is required for PAPER dispatch authority.
 
-## Development and verification
+## Verification
 
 ```sh
 npm run typecheck
@@ -63,71 +71,71 @@ npm run test:lightlight
 npm run build
 ```
 
-`npm run test:lightlight` is the CI-aligned application suite: deterministic
-research, execution, Alpaca PAPER boundary, and worker-invariant tests. The
-repository also retains `npm test`, which runs inherited platform/scaffold tests
-in addition to the application tests.
+The ownership integration suite uses a real configured database and makes no Alpaca order request:
 
-`npm run build` is safe without `DATABASE_URL`: its migration step explicitly
-skips when no database URL is configured.
+```sh
+npm run test:alpaca-worker-ownership
+```
 
-## Alpaca PAPER worker
+## PAPER operation
 
-With PAPER credentials and a durable `DATABASE_URL` configured, start the
-session-owned worker with:
+Default SPY worker:
 
 ```sh
 npm run alpaca:worker -- start
 ```
 
-The read-only operational smoke command authenticates, reconciles, and observes
-a SPY bar without submitting an order:
+The 1-minute EMA/RSI arm can be selected explicitly:
+
+```sh
+npm run alpaca:worker -- start --arm ema_rsi_v1 --symbol SPY
+```
+
+Read-only durable observer:
+
+```sh
+npm run alpaca:observe -- --arm ema_rsi_v1 --symbol SPY --verbose
+```
+
+The observer requires `DATABASE_URL` only. It does not acquire dispatch ownership or use Alpaca credentials.
+
+Read-only smoke paths:
 
 ```sh
 npm run alpaca:worker:smoke -- --observe-only
+npm run alpaca:crypto-smoke
 ```
 
-For a compact, read-only stream of the worker's durable PAPER evidence in a
-separate terminal window, run:
+See [docs/ALPACA_PAPER_WORKER.md](docs/ALPACA_PAPER_WORKER.md) for authority, recovery, and operator semantics.
 
-```sh
-npm run alpaca:observe
-```
+## Current engineering priorities
 
-The observer requires only `DATABASE_URL`; it does not connect to Alpaca or
-need Alpaca credentials. Use `-- --once`, `-- --interval 2`, or `-- --verbose`
-for a one-shot snapshot, a custom polling interval, or decision reasons.
+1. Make durable `worker_runs` lifecycle state faithfully track `STARTING -> RECONCILING -> READY` and terminal states.
+2. Package PAPER sessions as immutable experiment manifests that reference existing durable evidence.
+3. Make offline replay reproduce live decision and execution timing before comparing PAPER and historical results.
+4. Improve operator telemetry so no-position-change reconciliation is not visually confused with a broker cancellation.
+5. Complete repository/main-branch consolidation and remove merged stale branches.
+6. Only then resume strategy iteration, starting with prospectively defined turnover-suppression experiments.
 
-The worker and smoke commands are intentionally excluded from CI. See the
-[Alpaca PAPER worker guide](docs/ALPACA_PAPER_WORKER.md) for operator controls,
-the explicit dispatch procedure, and its fail-closed recovery behavior.
+## Known limitations
 
-## Web deployment boundary
-
-Vercel serves the UI and web-server boundary only. The persistent Alpaca PAPER
-worker belongs on a separate always-on host and is never started by a Vercel
-build, request, or server function. See the [Vercel deployment guide](docs/VERCEL_DEPLOYMENT.md)
-for the environment-variable matrix and deployment procedure.
-
-## Limitations
-
-- PAPER only; no live-money execution path.
-- SPY only.
-- Regular-hours eligibility uses a weekday/time heuristic, not a complete
-  exchange calendar.
-- Strategy thresholds are research heuristics, not validated production alpha.
-- Deployment and market-hours soak testing remain pending.
+- Regular-hours eligibility uses a weekday/time heuristic rather than a full exchange calendar.
+- `ema_rsi_v1` thresholds are uncalibrated research heuristics; the September 22 run showed substantial short-horizon churn.
+- PAPER execution timing observed live must still be encoded exactly in the evaluator/replay contract.
+- Formal immutable `ExperimentRun` packaging is not yet implemented.
+- Multi-symbol PAPER authority does not exist; portfolio-level exposure and arbitration controls are intentionally deferred.
+- The bounded equity relay contract requires explicit subscription-union behavior before multi-symbol live evidence collection is considered complete.
+- BTC/USD is read-only durable infrastructure, not a PAPER execution runtime.
+- The repository still contains inherited app-builder/Grok substrate that requires a dependency-aware cleanup rather than blind deletion.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — boundaries, deterministic pipeline,
-  and causal invariant.
-- [Evidence contract](docs/EVIDENCE_CONTRACT.md) — decision/execution evidence,
-  provenance, and immutability.
-- [Alpaca PAPER worker](docs/ALPACA_PAPER_WORKER.md) — authority, reconciliation,
-  persistence, and operator controls.
-- [Vercel deployment](docs/VERCEL_DEPLOYMENT.md) — web/worker boundary and
-  deployment environment contract.
-- [Execution model](docs/EXECUTION_MODEL.md) — causal fills, accounting, and
-  unknown execution state.
-- [Roadmap](docs/ROADMAP.md) — research milestones and known work remaining.
+- [Project status](docs/PROJECT_STATUS.md) — current implementation, proven boundaries, known gaps, and branch state.
+- [Architecture](docs/ARCHITECTURE.md) — research/execution boundaries and causal invariants.
+- [Evidence contract](docs/EVIDENCE_CONTRACT.md) — decision/execution provenance and immutability.
+- [Experiment contract](docs/EXPERIMENT_CONTRACT.md) — reproducibility and controlled-comparison rules.
+- [Alpaca PAPER worker](docs/ALPACA_PAPER_WORKER.md) — dispatch authority, reconciliation, persistence, and operator controls.
+- [BTC PAPER runtime](docs/BTC_PAPER_RUNTIME.md) — B0-B3 read-only crypto/runtime work and deferred execution scope.
+- [Relay capability](docs/lightlight-relay-capability.md) — bounded single-upstream equity subscription contract.
+- [Execution model](docs/EXECUTION_MODEL.md) — causal fills, accounting, and unknown execution state.
+- [Roadmap](docs/ROADMAP.md) — current milestones and sequencing.

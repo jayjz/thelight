@@ -1,16 +1,29 @@
 # Alpaca PAPER worker
 
-The worker is a server-side, single-symbol (`SPY`) owner for one PAPER session.
-It uses Alpaca closed 1Min bars, emits decisions only for fully populated,
-completed 15Min buckets, and uses the existing deterministic `ema_trend` / Arm
-`C` / risk path. React observes its snapshot and has no broker submission API.
-Server-only controls in `alpaca-worker-control.server.ts` provide `start`,
-`stop`, `status`, and `reconcile`; they are deliberately not UI routes.
+The PAPER execution boundary is server-side and SPY-only for broker authority.
+The repository currently supports two dispatch-capable SPY strategy runtimes:
 
-Run a session-owned worker process with:
+- the original `ema_trend` / Arm C path over completed 15-minute buckets;
+- `ema_rsi_v1` over completed 1-minute bars.
+
+QQQ, IWM, AAPL, and MSFT may run bounded `ema_rsi_v1` evidence paths but are
+`READ_ONLY_DURABLE`; they have no broker or trade-update authority. BTC/USD
+also remains read-only durable.
+
+React and the observer are presentation/read-only boundaries. Server-only
+controls in `alpaca-worker-control.server.ts` provide `start`, `stop`,
+`status`, and `reconcile`; they are deliberately not UI routes.
+
+Run the default session-owned SPY worker with:
 
 ```sh
 npm run alpaca:worker -- start
+```
+
+Run the explicit 1-minute EMA/RSI SPY arm with:
+
+```sh
+npm run alpaca:worker -- start --arm ema_rsi_v1 --symbol SPY
 ```
 
 It requires a durable `DATABASE_URL`; a process without it halts before it can
@@ -56,13 +69,16 @@ graceful/operator and fail-closed meanings. Graceful shutdown terminalizes its
 run and makes its exact lease immediately replaceable; expiry remains the
 recovery path if it crashes.
 
-The worker key is a pure `AssetSpec` runtime identity:
-`alpaca-paper:<symbol>:15Min:alpaca-paper-worker-v1`. The existing SPY value is
-unchanged. B3 also establishes `BTC/USD`'s distinct key and fenced durable
-market/checkpoint namespace. This does not grant BTC dispatch: its
-`READ_ONLY_DURABLE` runtime has no broker reconciliation, trade-update, intent
-claim, or broker POST capability. The SPY worker remains the only
-`DISPATCH_CAPABLE` implementation described by this document.
+Worker identity is derived from the bounded asset/strategy/timeframe runtime.
+The original SPY 15-minute worker key is preserved for compatibility, while the
+1-minute `ema_rsi_v1` arm has its own deterministic worker key and therefore
+its own run/lease/checkpoint scope.
+
+B3 also establishes `BTC/USD`'s distinct fenced durable market/checkpoint
+namespace. This does not grant BTC dispatch: its `READ_ONLY_DURABLE` runtime
+has no broker reconciliation, trade-update, intent claim, or broker POST
+capability. QQQ/IWM/AAPL/MSFT are likewise evidence-only. SPY remains the only
+asset with `DISPATCH_CAPABLE` broker authority.
 
 ```text
 STARTING -> RECONCILING -> READY
@@ -118,6 +134,13 @@ broker POST, the fenced owner durably marks intent state
 `SUBMISSION_ATTEMPTED`; restart reconciles that deterministic client order
 identity and never treats it as new permission to submit again.
 
+Broker observations and the current intent projection are updated through a
+fenced transaction. A confirmed Alpaca `fill` advances the associated intent
+to `FILLED`; duplicate/replayed fills are idempotent, partial fills remain
+nonterminal, and delayed nonterminal observations cannot regress an already
+terminal intent. Broker/trade-update observations remain append-oriented
+evidence rather than being rewritten into the decision record.
+
 The lease mechanism has SQL-backed concurrency coverage via
 `npm run test:alpaca-worker-ownership`. It makes no Alpaca request. Market-hours
 soak is still required to observe lease renewal and takeover behavior alongside
@@ -145,3 +168,15 @@ storage and invokes the worker path itself. It reports the deterministic
 decision/intent/client-order identities, reconciled position, persisted broker
 order state, and whether policy actually produced a dispatch. It never
 constructs a raw order POST.
+
+
+## Current hardening work
+
+As of 2026-09-22, the next runtime-correctness item is durable worker lifecycle
+truth. The in-memory worker can reach operational READY while the corresponding
+`worker_runs` row remains STARTING. The target contract is to persist
+`STARTING -> RECONCILING -> READY` only after each transition actually occurs,
+while preserving STOPPED, HALTED, and SUPERSEDED terminal semantics.
+
+This lifecycle repair must not alter broker authority, strategy behavior, or
+recovery rules.

@@ -2,480 +2,321 @@
 
 ## Mission
 
-Build a causally correct, evidence-producing quantitative research terminal for testing deterministic strategies and bounded Jev classifications against reproducible market data.
+Build a causally correct, evidence-producing quantitative research system that can run bounded PAPER experiments, preserve enough state to reconstruct every decision and execution event, and compare deterministic or typed-model treatments without collapsing research, risk, and broker authority.
 
-The roadmap prioritizes correctness and experimental integrity before live connectivity.
-
----
-
-# P0 — Prototype baseline
-
-Status: implemented, requires hardening.
-
-Current capabilities:
-
-- seeded synthetic candles,
-- deterministic quantitative features,
-- EMA trend candidate strategy,
-- RSI mean-reversion candidate strategy,
-- deterministic market regime,
-- mock Jev adapter,
-- experiment arms A–D,
-- deterministic risk governor,
-- replay terminal,
-- evidence inspection,
-- basic evaluation metrics.
-
-Known limitations:
-
-- synthetic data,
-- in-sample results,
-- mock Jev,
-- uncalibrated thresholds,
-- zero transaction costs,
-- zero slippage,
-- evidence primarily browser-memory state,
-- exported Grok platform scaffolding,
-- execution/evaluation timing mismatch identified during audit.
+This roadmap reflects repository state as of **2026-09-22**. Older phase descriptions that treated live observation and PAPER brokerage as future work are superseded by the status below.
 
 ---
 
-# P0.2 — Causal execution foundation
+## Current baseline
 
-Priority: immediate.
+### Proven in repository and PAPER operation
+
+- deterministic feature and strategy pipelines;
+- replay/evaluation foundations;
+- immutable decision evidence;
+- durable Postgres PAPER evidence;
+- Alpaca IEX market-data ingestion;
+- local bounded equity relay contract;
+- market-gap detection, historical recovery, and provenance;
+- Alpaca PAPER broker reconciliation;
+- deterministic client-order identity;
+- durable `SUBMISSION_ATTEMPTED` marker;
+- Postgres lease ownership and monotonic fencing;
+- restart/recovery semantics that fail closed on uncertainty;
+- broker trade-update ingestion;
+- broker-authoritative fill projection;
+- SPY 15-minute `ema_trend` PAPER path;
+- SPY 1-minute `ema_rsi_v1` PAPER path;
+- bounded read-only equity runtimes for QQQ, IWM, AAPL, and MSFT;
+- read-only durable BTC/USD runtime and crypto market-data adapter;
+- read-only operational observer;
+- Vercel/web isolation from long-lived worker authority.
+
+The September 22, 2026 SPY PAPER run produced actual PAPER fills and durable execution evidence. It also exposed strategy churn and several evidence/operational issues that now drive the next milestones.
+
+---
+
+# P0 — Research and causal contracts
+
+**Status: substantially implemented**
+
+The project has deterministic features, strategies, policy/risk boundaries, replay foundations, evidence contracts, and explicit causal rules.
+
+Remaining cleanup:
+
+- reconcile older documentation with current runtime behavior;
+- ensure evaluation timing matches observed PAPER execution semantics;
+- continue separating research claims from implementation heuristics.
+
+---
+
+# P1 — Bounded PAPER execution foundation
+
+**Status: implemented and live-tested**
+
+Implemented:
+
+- durable worker runs and checkpoints;
+- Alpaca PAPER account/position/open-order reconciliation;
+- append-oriented broker order and position observations;
+- `trade_updates` persistence;
+- deterministic order/client identity;
+- uncertain-submission recovery;
+- `UNKNOWN` fail-closed behavior;
+- `SUBMISSION_ATTEMPTED` crash-window protection;
+- single-owner Postgres lease;
+- monotonic fencing token;
+- final pre-POST authority check;
+- market-data continuity and verified gap recovery;
+- PAPER equity/drawdown evidence;
+- SPY PAPER order/fill path.
+
+Recent hardening:
+
+- fill projection now treats Alpaca `fill` as terminal;
+- delayed nonterminal broker observations cannot regress a terminal intent;
+- duplicate/replayed fills remain idempotent;
+- stale fencing cannot apply execution projection or gain POST authority.
+
+### Current P1 issue
+
+Durable `worker_runs.state` can lag the in-memory worker lifecycle (for example remain `STARTING` after the runtime is operationally READY). Lifecycle persistence hardening is the active runtime-correctness task.
+
+---
+
+# P2 — Reproducible PAPER experiment harness
+
+**Status: next major milestone**
 
 ## Goal
 
-Establish one canonical execution model from which all positions, equity, fills, and performance metrics derive.
+Turn a live PAPER session into a first-class immutable experiment artifact without duplicating existing durable evidence.
 
-## Work
+Implement an `ExperimentRun`/session manifest that records or references:
 
-- define `ExecutionIntent`,
-- define `Fill`,
-- define `PositionTransition`,
-- define `EquityPoint`,
-- implement canonical execution ledger,
-- remove duplicate P&L reconstruction,
-- fix next-bar-close timing,
-- apply transaction costs through execution,
-- apply slippage through execution,
-- derive metrics from ledger only.
+- experiment/run ID;
+- worker run ID;
+- source-code revision;
+- strategy ID/version;
+- symbol and timeframe;
+- configuration identity/hash;
+- market-data source/provenance;
+- start/end timestamps;
+- starting/ending PAPER equity;
+- decision IDs;
+- execution-intent IDs;
+- broker order/fill references;
+- recovery/halt events;
+- terminal experiment status;
+- derived metrics.
 
-## Hard invariant
+The manifest should reference existing append-oriented evidence rather than copy it into a second competing ledger.
 
-A decision based on closed bar `t` cannot receive exposure to the return from `t` to its declared fill at `t+1`.
+### Acceptance criteria
 
-## Acceptance criteria
+A completed PAPER session can be exported and audited without relying on the terminal/observer process that happened to be open during the session.
 
-Tests prove:
+---
+
+# P2.1 — Live-to-offline parity
+
+**Status: required before strategy optimization**
+
+## Goal
+
+Replay an observed PAPER session from frozen bars and reproduce its deterministic decisions exactly.
+
+Require parity for:
+
+- feature warmup;
+- EMA/RSI values;
+- strategy target;
+- risk-approved target;
+- decision timestamps;
+- transition count;
+- dispatch eligibility.
+
+The evaluator must then encode the execution timing actually used by PAPER. Live observation on September 22 showed decisions after a completed minute followed by PAPER fills near the start of the next minute; do not compare PAPER results with a materially different historical fill convention.
+
+### Acceptance criteria
+
+For a frozen PAPER session:
 
 ```text
-decision[t] cannot affect P&L before fill[t+1]
-fill[t+1] can affect subsequent returns
-risk veto cannot create exposure
-metrics equity equals ledger equity
-costs are applied exactly once
-slippage is applied exactly once
+live deterministic target sequence == replay deterministic target sequence
+```
 
-No real market data or real Jev integration during this phase.
+and any modeled fill difference is explicit, versioned, and attributable to the execution model.
 
-P0.3 — Evidence contract
-Goal
+---
 
-Make every decision independently interpretable and reproducible.
+# P3 — Strategy research with costs
 
-Implement:
+**Status: blocked on P2/P2.1**
 
-EvidenceEnvelope
-DecisionEvidence
-ExecutionRecord
+The `ema_rsi_v1` run demonstrated that execution works but the initial 1-minute heuristic can churn around small EMA crossings.
 
-Required provenance:
+Do not retrospectively tune September 22 until it becomes profitable.
 
-schema version,
-decision ID,
-timestamp,
-dataset ID,
-dataset hash,
-feature version,
-strategy version,
-policy version,
-risk version,
-configuration version,
-configuration hash,
-Jev adapter ID,
-Jev model ID,
-research references,
-source code revision where available.
+Freeze candidate experiments prospectively. Initial controlled variants may test one change at a time:
 
-Decision evidence must not be retroactively mutated with future fills.
+- minimum EMA separation;
+- multi-bar entry confirmation;
+- minimum hold interval;
+- post-exit cooldown;
+- explicit transaction-cost/turnover gate.
 
-Execution events reference decision IDs.
+Metrics must include at least:
 
-Acceptance criteria
+- return;
+- Sharpe/Sortino where sample size supports them;
+- max drawdown;
+- exposure;
+- round trips;
+- hit rate;
+- turnover;
+- average/median hold;
+- signal flips;
+- gross winner/loss totals;
+- profit factor;
+- modeled spread/slippage sensitivity.
 
-Given:
+Use chronological development/validation partitions and retain failed experiments.
 
-dataset
-configuration
-source revision
-decision evidence
+---
 
-the deterministic portion of a historical decision can be reconstructed.
+# P4 — Operational hardening and soak
 
-P0.4 — Durable replay storage
-Goal
+**Status: partially complete**
 
-Move research state out of transient browser memory.
+Before treating the worker as a routine PAPER experiment service:
 
-Initial storage:
+- repair durable lifecycle-state persistence;
+- make no-position-change observer semantics explicit;
+- add/verify exchange-calendar behavior beyond the weekday/time heuristic;
+- verify graceful stop, crash, lease expiry, takeover, reconnect, and reconciliation over multiple sessions;
+- complete multi-day SPY PAPER soak;
+- preserve exact operator and recovery evidence.
 
-SQLite
+---
 
-Target records:
+# P5 — Bounded multi-equity evidence
 
-datasets
-bars
-experiment_runs
-decisions
-jev_calls
-execution_intents
-fills
-positions
-equity
+**Status: implementation exists; infrastructure validation incomplete**
 
-Requirements:
+Bounded universe:
 
-append-oriented event history,
-schema versioning,
-deterministic IDs where appropriate,
-explicit foreign-key relationships,
-no silent overwriting of historical experiment state.
+- SPY;
+- QQQ;
+- IWM;
+- AAPL;
+- MSFT.
 
-The terminal should consume persisted/replayable state through a data interface.
+Only SPY is dispatch capable.
 
-P0.5 — Repository cleanup
-Goal
+QQQ/IWM/AAPL/MSFT remain `READ_ONLY_DURABLE`.
 
-Separate LIGHTLIGHT from unnecessary Grok Build substrate.
+Before a five-symbol evidence soak, prove the local relay can merge explicit downstream symbol requests into one bounded Alpaca upstream subscription. Do not open multiple upstream Alpaca equity sockets as a workaround.
 
-Audit:
+---
 
-.grok/
-src/lib/auth/
-src/lib/app-data/
-src/lib/multiplayer/
-preview bridge files
-generic database plumbing
-server scaffolding
+# P6 — Portfolio PAPER authority
 
-Remove only after determining actual runtime dependencies.
+**Status: deferred**
 
-Also:
+Do not grant non-SPY broker authority until there is an explicit account/portfolio control plane for:
 
-rename package from generic builder name,
-add .env.example,
-tighten .gitignore,
-remove generated logs,
-remove local deployment metadata where unnecessary,
-create normal project README,
-document supported development commands.
+- gross exposure;
+- per-symbol exposure;
+- buying power;
+- simultaneous intent arbitration;
+- account-level drawdown;
+- cross-symbol open orders;
+- duplicate/correlated exposure.
 
-Do not mix repository cleanup with quantitative behavior changes unless required.
+This is a separate execution milestone, not an incidental flag change.
 
-P1 — Market-source abstraction
-Goal
+---
 
-Make replay independent of synthetic data generation.
+# P7 — Crypto PAPER execution
 
-Contract:
+**Status: deferred after BTC B3**
 
-interface MarketSource {
-  id: string;
-  bars(): AsyncIterable<ClosedBar>;
-}
+Completed for BTC/USD:
 
-Implement:
+- B0: freeze SPY behavior;
+- B1: explicit asset/runtime contract;
+- B2: read-only Alpaca crypto market-data adapter;
+- B3: independent durable runtime identity, lease, checkpoint, and evidence namespace.
 
-SyntheticMarketSource
-HistoricalFileMarketSource
+Not implemented:
 
-Each source must define:
+- fractional broker execution;
+- BTC broker reconciliation;
+- BTC-specific risk/cost calibration;
+- 24/7 execution soak.
 
-timezone,
-timestamp semantics,
-bar-close semantics,
-symbol identity,
-timeframe,
-missing-bar behavior,
-dataset hash,
-provenance.
-P1.1 — Real historical dataset
+Keep BTC read-only until the single-asset PAPER research loop is reproducible and operationally stable.
 
-Initial target:
+---
 
-SPY
-1D
+# P8 — Typed-model / Jev experiments
 
-Reason:
+**Status: deferred behind deterministic controls**
 
-Daily data reduces market-microstructure complexity while data, causal, and evaluation contracts are validated.
+The model may classify bounded supplied state but must not own:
 
-Required handling:
+- indicator calculation;
+- position sizing;
+- P&L;
+- transaction costs;
+- risk limits;
+- dispatch.
 
-adjusted vs unadjusted prices explicitly declared,
-corporate actions documented,
-session calendar explicit,
-missing sessions explicit,
-duplicate bars rejected,
-timestamps normalized,
-provenance stored.
+Before evaluating a real Jev treatment:
 
-No optimization against final OOS data.
+- freeze deterministic control behavior;
+- freeze execution rules;
+- freeze evaluation rules;
+- preserve exact request/response evidence;
+- evaluate model classification quality separately from trading P&L.
 
-P1.2 — Experiment runner
-Goal
+---
 
-Separate experimental execution from UI state.
+# Repository cleanup
 
-Define:
+**Status: needed, not a trading-runtime blocker**
 
-ExperimentSpec
-ExperimentRun
+The integration branch has accumulated the current execution/runtime work while `main` remains behind it. Consolidate the proven integration baseline onto `main`, then remove merged stale branches.
 
-ExperimentSpec should identify:
+Dependency-audit inherited builder substrate before deleting it:
 
-dataset,
-date range,
-strategy,
-experiment arm,
-thresholds,
-Jev adapter,
-feature version,
-policy version,
-risk version,
-fill model,
-costs,
-slippage,
-random seed where applicable.
+- `.grok/`;
+- auth/app-data/multiplayer support;
+- preview bridge files;
+- generic server/database scaffolding;
+- Grok PWA test utilities.
 
-ExperimentRun produces:
+Also rename the generic package name `app-builder-workspace` when the dependency boundary is understood.
 
-decision evidence,
-execution ledger,
-metrics,
-provenance,
-run ID.
+Do not mix this cleanup with strategy changes.
 
-A run must be reproducible from its specification and immutable inputs.
+---
 
-P2 — Real TypeSafe Jev
-Goal
+# Immediate sequence
 
-Replace the mock adapter without changing downstream contracts.
+1. Durable `worker_runs` lifecycle truth.
+2. Immutable PAPER experiment-session manifest.
+3. Live-to-offline replay parity and exact execution-timing model.
+4. Observer no-op semantics and operational soak hardening.
+5. Consolidate integration branch to `main`; prune merged branches.
+6. Prospectively defined SPY strategy experiments with costs.
+7. Five-symbol read-only soak after relay subscription-union proof.
+8. Portfolio PAPER authority only after explicit portfolio risk/arbitration design.
+9. BTC PAPER execution later.
+10. Typed-model/Jev treatments only after deterministic controls are stable.
 
-Add:
+## Principle
 
-TypeSafeJevAdapter
-
-Keep:
-
-MockJevAdapter
-RecordedJevAdapter
-
-Requirements:
-
-API credentials server-side only,
-model ID recorded,
-exact request stored,
-exact typed response stored,
-latency stored,
-API/schema failure distinguishable from valid negative classification,
-timeout behavior explicit,
-no automatic fallback masquerading as real Jev.
-
-Freeze deterministic Arm C before evaluating live Arm D.
-
-Compare:
-
-A — baseline
-B — deterministic strategy
-C — deterministic strategy + deterministic regime
-D — deterministic strategy + TypeSafe Jev
-
-The treatment must not alter features, risk, execution, or accounting.
-
-P2.1 — Jev evaluation
-
-Evaluate Jev separately from trading P&L.
-
-Potential metrics:
-
-Brier score,
-classification accuracy against declared proxy,
-calibration curves,
-confidence buckets,
-selective accuracy,
-abstention behavior,
-classification stability,
-latency,
-cost per classification.
-
-Any proxy regime labeling algorithm must be versioned and documented.
-
-Do not call proxy-label calibration general model calibration.
-
-P3 — Transaction-cost model
-
-Replace zero-cost assumptions.
-
-Implement explicit:
-
-commission,
-spread,
-slippage,
-turnover costs.
-
-All assumptions versioned.
-
-Run sensitivity analysis across plausible cost ranges rather than reporting a single favorable assumption.
-
-P3.1 — Walk-forward evaluation
-Goal
-
-Move from diagnostic replay to valid out-of-sample experimentation.
-
-Dataset separation:
-
-development
-calibration
-validation
-final untouched OOS
-
-Rules:
-
-thresholds may change during development,
-calibration rules must be declared,
-final OOS is evaluated once under frozen configuration,
-failed experiments are retained,
-experiment metadata is persisted,
-no retrospective threshold adjustment against final OOS.
-
-Support rolling / walk-forward experiments.
-
-P4 — Intraday historical data
-
-After daily-data correctness:
-
-SPY 15m
-
-Additional concerns:
-
-exchange sessions,
-half days,
-timezone/DST handling,
-gaps,
-overnight returns,
-volume semantics,
-spread assumptions,
-timestamp boundaries.
-
-Do not add indicators merely because higher-resolution data is available.
-
-P5 — Live market observation
-Goal
-
-Make the terminal genuinely live without adding brokerage authority.
-
-Implement:
-
-LiveMarketSource
-
-Backend emits domain events such as:
-
-BAR_CLOSED
-FEATURES_COMPUTED
-SIGNAL_GENERATED
-JEV_REQUESTED
-JEV_COMPLETED
-POLICY_COMPLETED
-RISK_COMPLETED
-DECISION_WRITTEN
-
-Frontend subscribes and visualizes.
-
-The backend remains authoritative.
-
-No partial/incomplete candle may be treated as closed unless explicitly supported by a separate experimental mode.
-
-P5.1 — Live terminal
-
-UI evolves from replay-only to replay/live observation.
-
-Display:
-
-market source,
-connection health,
-latest closed bar,
-feature state,
-strategy signal,
-Jev typed classification,
-policy result,
-risk result,
-evidence ID,
-experiment/config version.
-
-Historical evidence remains inspectable.
-
-P6 — Paper broker
-Goal
-
-Test execution against a real paper-broker environment.
-
-Execution interface:
-
-ExecutionPort
-├── ReplayExecution
-└── PaperBrokerExecution
-
-Requirements:
-
-idempotent order identity,
-broker-authoritative state reconciliation,
-uncertain submission handling,
-explicit rejection handling,
-recovery after process restart,
-execution evidence,
-no assumption that client-side intent equals broker state.
-
-Paper trading only.
-
-P7 — Multi-asset research
-
-Only after the single-asset pipeline is validated.
-
-Potential additions:
-
-cross-sectional mean reversion,
-residual/factor strategies,
-multiple simultaneous symbols,
-portfolio exposure,
-covariance-aware risk.
-
-This is where Kakushadze-style cross-sectional methodology becomes substantially more appropriate than the current single-series heuristic.
-
-Deferred
-
-Explicitly deferred until earlier contracts are sound:
-
-live-money trading,
-strategy self-modification,
-automatic parameter optimization,
-large indicator libraries,
-reinforcement-learning execution,
-autonomous model-generated strategies,
-model-controlled risk limits.
-Immediate next milestone
-P0.2 — canonical execution ledger + causal metrics + regression tests
-
-Do not add live data, TypeSafe Jev, or brokerage connectivity until P0.2 passes.
+Change one meaningful thing, preserve everything else, and retain enough evidence to prove what actually changed.
