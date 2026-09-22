@@ -1,10 +1,12 @@
 import type { ClosedBar, ExecutionIntent, ExecutionStatus } from "./types.ts";
 import type { MarketSource } from "./market.ts";
+import { SPY_SPEC, alpacaEquityFeedFor, isBoundedEquitySymbol, type BoundedEquitySymbol } from "./assets.ts";
 
 export const ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 export const ALPACA_DATA_BASE_URL = "https://data.alpaca.markets";
 export const ALPACA_IEX_STREAM_URL = "wss://stream.data.alpaca.markets/v2/iex";
 export const ALPACA_PAPER_TRADE_STREAM_URL = "wss://paper-api.alpaca.markets/stream";
+const LOCAL_RELAY_ORIGINS = new Set(["ws://127.0.0.1:8765", "ws://localhost:8765"]);
 
 export type AlpacaConfig = {
   apiKeyId: string;
@@ -12,7 +14,7 @@ export type AlpacaConfig = {
   paperBaseUrl: typeof ALPACA_PAPER_BASE_URL;
   dataBaseUrl: typeof ALPACA_DATA_BASE_URL;
   dataFeed: "iex" | "sip" | "delayed_sip";
-  symbol: string;
+  symbol: BoundedEquitySymbol;
 };
 
 export class AlpacaConfigurationError extends Error {
@@ -27,9 +29,23 @@ export class AlpacaConfigurationError extends Error {
 }
 
 export class AlpacaTransportError extends Error {
-  readonly kind: "AUTHENTICATION_FAILURE" | "UNSUPPORTED_DATA_FEED" | "DISCONNECTED_STREAM" | "HTTP_FAILURE";
+  readonly kind:
+    | "AUTHENTICATION_FAILURE"
+    | "UNSUPPORTED_DATA_FEED"
+    | "DISCONNECTED_STREAM"
+    | "HTTP_FAILURE"
+    | "SUBSCRIPTION_FAILURE"
+    | "PROTOCOL_FAILURE"
+    | "TIMEOUT";
   constructor(
-    kind: "AUTHENTICATION_FAILURE" | "UNSUPPORTED_DATA_FEED" | "DISCONNECTED_STREAM" | "HTTP_FAILURE",
+    kind:
+      | "AUTHENTICATION_FAILURE"
+      | "UNSUPPORTED_DATA_FEED"
+      | "DISCONNECTED_STREAM"
+      | "HTTP_FAILURE"
+      | "SUBSCRIPTION_FAILURE"
+      | "PROTOCOL_FAILURE"
+      | "TIMEOUT",
     message: string,
   ) {
     super(message);
@@ -55,18 +71,36 @@ export function loadAlpacaConfig(env: NodeJS.ProcessEnv = process.env): AlpacaCo
   if (configuredDataUrl !== ALPACA_DATA_BASE_URL) {
     throw new AlpacaConfigurationError("INVALID_PAPER_DOMAIN", "ALPACA_DATA_BASE_URL is not supported.");
   }
-  const dataFeed = (env.ALPACA_DATA_FEED?.trim() || "iex").toLowerCase();
+  const dataFeed = (env.ALPACA_DATA_FEED?.trim() || alpacaEquityFeedFor(SPY_SPEC)).toLowerCase();
   if (dataFeed !== "iex" && dataFeed !== "sip" && dataFeed !== "delayed_sip") {
     throw new AlpacaConfigurationError("UNSUPPORTED_DATA_FEED", `Unsupported Alpaca feed: ${dataFeed}.`);
   }
+  const symbol = (env.ALPACA_SYMBOL?.trim().toUpperCase() || SPY_SPEC.symbol);
+  if (!isBoundedEquitySymbol(symbol)) throw new AlpacaConfigurationError("INVALID_PAPER_DOMAIN", "ALPACA_SYMBOL must be in the configured bounded equity universe.");
   return {
     apiKeyId: requiredEnv(env, "ALPACA_API_KEY_ID"),
     apiSecretKey: requiredEnv(env, "ALPACA_API_SECRET_KEY"),
     paperBaseUrl: ALPACA_PAPER_BASE_URL,
     dataBaseUrl: ALPACA_DATA_BASE_URL,
     dataFeed,
-    symbol: env.ALPACA_SYMBOL?.trim().toUpperCase() || "SPY",
+    symbol,
   };
+}
+
+/**
+ * Opt-in, fixed-origin local market-data transport.  It has no bearing on
+ * PAPER account, order, or trade-update connections, which remain hard-bound.
+ */
+export function loadLocalMarketDataUrl(env: NodeJS.ProcessEnv = process.env): string | null {
+  const value = env.ALPACA_LOCAL_FEED_URL?.trim();
+  if (!value) return null;
+  if (!LOCAL_RELAY_ORIGINS.has(value)) {
+    throw new AlpacaConfigurationError(
+      "INVALID_PAPER_DOMAIN",
+      "ALPACA_LOCAL_FEED_URL must be the fixed localhost market-data relay.",
+    );
+  }
+  return value;
 }
 
 export function alpacaHeaders(config: AlpacaConfig): HeadersInit {
@@ -86,6 +120,81 @@ export type AlpacaStockBarMessage = {
   v: number;
   t: string;
 };
+
+/** Read-only, bounded historical market-data boundary. It has no broker API. */
+export interface HistoricalStockBars {
+  bars(request: { symbol: BoundedEquitySymbol; start: number; end: number }): Promise<ClosedBar[]>;
+}
+
+function strictHistoricalBar(value: unknown, start: number, end: number): ClosedBar {
+  const bar = value as Record<string, unknown>;
+  const timestamp = typeof bar.t === "string" ? Date.parse(bar.t) : Number.NaN;
+  const open = Number(bar.o); const high = Number(bar.h); const low = Number(bar.l); const close = Number(bar.c); const volume = Number(bar.v);
+  if (!Number.isFinite(timestamp) || timestamp % 60_000 !== 0 || timestamp < start || timestamp >= end ||
+    ![open, high, low, close, volume].every(Number.isFinite) || volume < 0 || low > Math.min(open, close) || high < Math.max(open, close) || high < low) {
+    throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars failed strict validation.");
+  }
+  return { t: timestamp, open, high, low, close, volume };
+}
+
+/**
+ * Deliberately separate from AlpacaPaperBroker: this client can only retrieve
+ * bounded configured IEX 1-minute bars for a caller-provided bounded interval.
+ */
+export class AlpacaHistoricalStockBars implements HistoricalStockBars {
+  private readonly config: AlpacaConfig;
+  private readonly request: typeof fetch;
+
+  constructor(config: AlpacaConfig, request: typeof fetch = fetch) {
+    this.config = config;
+    this.request = request;
+    if (config.dataBaseUrl !== ALPACA_DATA_BASE_URL || !isBoundedEquitySymbol(config.symbol)) throw new Error("ALPACA_HISTORICAL_SCOPE_FORBIDDEN");
+  }
+
+  async bars({ symbol, start, end }: { symbol: BoundedEquitySymbol; start: number; end: number }): Promise<ClosedBar[]> {
+    if (!isBoundedEquitySymbol(symbol) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= end || start % 60_000 !== 0 || end % 60_000 !== 0) {
+      throw new Error("INVALID_HISTORICAL_BAR_RANGE");
+    }
+    const expected = (end - start) / 60_000;
+    if (expected > 390) throw new Error("HISTORICAL_BAR_RANGE_UNBOUNDED");
+    const url = new URL("/v2/stocks/bars", ALPACA_DATA_BASE_URL);
+    url.searchParams.set("symbols", symbol);
+    url.searchParams.set("timeframe", "1Min");
+    url.searchParams.set("feed", "iex");
+    url.searchParams.set("start", new Date(start).toISOString());
+    url.searchParams.set("end", new Date(end).toISOString());
+    url.searchParams.set("limit", String(expected));
+    url.searchParams.set("sort", "asc");
+    let response: Response;
+    try {
+      response = await this.request(url, { headers: alpacaHeaders(this.config), signal: AbortSignal.timeout(25_000) });
+    } catch (error) {
+      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+        throw new AlpacaTransportError("TIMEOUT", "Alpaca historical bars request timed out.");
+      }
+      throw new AlpacaTransportError("HTTP_FAILURE", "Alpaca historical bars request failed.");
+    }
+    if (response.status === 401 || response.status === 403) throw new AlpacaTransportError("AUTHENTICATION_FAILURE", "Alpaca historical market-data authentication failed.");
+    if (!response.ok) throw new AlpacaTransportError("HTTP_FAILURE", `Alpaca historical bars request failed: ${response.status}.`);
+    let body: { bars?: Record<string, unknown[]> };
+    try {
+      body = await response.json() as { bars?: Record<string, unknown[]> };
+    } catch {
+      throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was malformed.");
+    }
+    const values = body && typeof body === "object" && !Array.isArray(body) ? body.bars?.[symbol] : undefined;
+    if (!Array.isArray(values)) throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was malformed.");
+    const bars = values.map((value) => strictHistoricalBar(value, start, end));
+    const timestamps = new Set(bars.map((bar) => bar.t));
+    if (timestamps.size !== bars.length) throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response contains duplicate timestamps.");
+    for (let timestamp = start; timestamp < end; timestamp += 60_000) {
+      if (!timestamps.has(timestamp)) {
+        throw new AlpacaTransportError("PROTOCOL_FAILURE", "Alpaca historical bars response was incomplete.");
+      }
+    }
+    return bars.sort((left, right) => left.t - right.t);
+  }
+}
 
 /** A 1Min bar may enter only after its own minute has elapsed. */
 export function closedBarFromAlpaca(
@@ -132,16 +241,28 @@ export class AlpacaMarketSource implements MarketSource {
     config: AlpacaConfig,
     createSocket: WebSocketFactory = (url) => new WebSocket(url),
     now: () => number = Date.now,
+    localFeedUrl: string | null = loadLocalMarketDataUrl(),
   ) {
+    if (localFeedUrl && !LOCAL_RELAY_ORIGINS.has(localFeedUrl)) {
+      throw new AlpacaConfigurationError(
+        "INVALID_PAPER_DOMAIN",
+        "Local market-data transport must be the fixed localhost relay.",
+      );
+    }
     this.config = config;
     this.createSocket = createSocket;
     this.now = now;
-    this.id = `alpaca:${config.dataFeed}:${config.symbol}:1Min`;
+    this.id = localFeedUrl
+      ? `alpaca-local-relay:${config.dataFeed}:${config.symbol}:1Min`
+      : `alpaca:${config.dataFeed}:${config.symbol}:1Min`;
+    this.localFeedUrl = localFeedUrl;
   }
+
+  private readonly localFeedUrl: string | null;
 
   async *bars(): AsyncIterable<ClosedBar> {
     const feed = this.config.dataFeed;
-    const streamUrl = `wss://stream.data.alpaca.markets/v2/${feed}`;
+    const streamUrl = this.localFeedUrl ?? `wss://stream.data.alpaca.markets/v2/${feed}`;
     const socket = this.createSocket(streamUrl);
     const queue: ClosedBar[] = [];
     let failure: Error | undefined;
@@ -157,16 +278,21 @@ export class AlpacaMarketSource implements MarketSource {
         try {
           const messages = JSON.parse(await websocketPayloadToText(event.data)) as Array<Record<string, unknown>>;
           for (const message of messages) {
-            if (message.T === "success" && message.msg === "connected") {
+            if (!this.localFeedUrl && message.T === "success" && message.msg === "connected") {
               socket.send(JSON.stringify({ action: "auth", key: this.config.apiKeyId, secret: this.config.apiSecretKey }));
-            } else if (message.T === "success" && message.msg === "authenticated") {
+            } else if (!this.localFeedUrl && message.T === "success" && message.msg === "authenticated") {
               socket.send(JSON.stringify({ action: "subscribe", bars: [this.config.symbol] }));
+            } else if (this.localFeedUrl && message.T === "relay") {
+              failure = new AlpacaTransportError("DISCONNECTED_STREAM", "Local market-data relay is unavailable.");
             } else if (message.T === "error") {
               failure = new AlpacaTransportError(
                 Number(message.code) === 402 ? "AUTHENTICATION_FAILURE" : "UNSUPPORTED_DATA_FEED",
                 String(message.msg ?? "Alpaca data-stream error."),
               );
             } else {
+              // A relay may carry the bounded union; this consumer accepts only
+              // its runtime asset, so one symbol can never enter another's state.
+              if (String(message.S ?? "").toUpperCase() !== this.config.symbol) continue;
               const bar = closedBarFromAlpaca(message as unknown as AlpacaStockBarMessage, this.now());
               if (bar) queue.push(bar);
             }
@@ -185,6 +311,11 @@ export class AlpacaMarketSource implements MarketSource {
     socket.addEventListener("close", () => {
       failure ??= new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca data stream closed.");
       signal();
+    });
+    socket.addEventListener("open", () => {
+      if (this.localFeedUrl) {
+        socket.send(JSON.stringify({ action: "subscribe", bars: [this.config.symbol] }));
+      }
     });
     try {
       for (;;) {
@@ -324,19 +455,28 @@ export class AlpacaPaperBroker {
 export function brokerStateFromTradeUpdate(
   update: Record<string, unknown>,
   intent: ExecutionIntent,
+  symbol: string,
 ): BrokerOrderState | null {
   if (update.stream !== "trade_updates") return null;
   const data = update.data as Record<string, unknown> | undefined;
   const order = data?.order as Record<string, unknown> | undefined;
-  if (!order) return null;
-  const clientOrderId = String(order.client_order_id ?? "");
-  if (clientOrderId !== (intent.clientOrderId ?? intent.intentId)) return null;
+  if (!order || typeof order !== "object" || Array.isArray(order)) return null;
+  const clientOrderId = order.client_order_id;
+  if (typeof clientOrderId !== "string" || clientOrderId !== (intent.clientOrderId ?? intent.intentId) ||
+    order.symbol !== symbol || typeof order.id !== "string" || !order.id) return null;
+  const eventStatus: Record<string, ExecutionStatus> = {
+    accepted: "ACCEPTED", pending_new: "ACCEPTED", new: "ACCEPTED", accepted_for_bidding: "ACCEPTED",
+    partial_fill: "PARTIALLY_FILLED", fill: "FILLED",
+    canceled: "CANCELLED", rejected: "REJECTED", expired: "CANCELLED", done_for_day: "CANCELLED",
+  };
+  const status = typeof data?.event === "string" ? eventStatus[data.event] : undefined;
+  if (!status) return null;
   return {
     decisionId: intent.decisionId,
     intentId: intent.intentId,
     clientOrderId,
-    brokerOrderId: String(order.id ?? "") || null,
-    status: orderStatus(order),
+    brokerOrderId: order.id,
+    status,
     updatedAt: String(order.updated_at ?? "") || null,
     rawStatus: String(order.status ?? data?.event ?? "") || null,
     lookup: "FOUND",

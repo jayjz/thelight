@@ -1,5 +1,6 @@
 import { THRESHOLDS, POLICY_VERSION, RISK_VERSION, STRATEGY_VERSION } from "./thresholds.ts";
 import { QUALITY_RANK } from "./jev.ts";
+import { applyDirectionalCapability, type AssetSpec } from "./assets.ts";
 import type {
   Action,
   DeterministicRegime,
@@ -229,6 +230,28 @@ export function evaluatePolicy(input: {
       QUALITY_RANK[a.MARKET_QUALITY.level] >= QUALITY_RANK[THRESHOLDS.minQuality],
     desired,
     reason,
+  };
+}
+
+/**
+ * Keeps strategy output separate from broker capability. SPY's LONG_SHORT
+ * contract is an identity mapping; future long-only assets are deterministic.
+ */
+export function evaluateAssetAwarePolicy(input: {
+  asset: AssetSpec;
+  arm: ExperimentArm;
+  strategyId: StrategyId;
+  signal: Signal;
+  detRegime: DeterministicRegime;
+  jev: JevResponse;
+}): PolicyEvaluation {
+  const policy = evaluatePolicy(input);
+  const desired = applyDirectionalCapability(input.asset, policy.desired);
+  if (desired === policy.desired) return policy;
+  return {
+    ...policy,
+    desired,
+    reason: `${policy.reason} Asset direction mode ${input.asset.directionMode} mapped unsupported SHORT to FLAT.`,
   };
 }
 

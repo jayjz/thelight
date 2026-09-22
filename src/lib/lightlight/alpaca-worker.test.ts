@@ -3,9 +3,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import type { BrokerAccountSnapshot, BrokerOrderState, BrokerPositionSnapshot, OpenBrokerOrder } from "./alpaca.server.ts";
-import { ALPACA_PAPER_BASE_URL, type AlpacaConfig } from "./alpaca.server.ts";
-import { AlpacaPaperWorker, MemoryAlpacaWorkerStore, deterministicClientOrderId, deterministicDecisionId, isRegularUsEquitySession } from "./alpaca-worker.server.ts";
+import type { BrokerAccountSnapshot, BrokerOrderState, BrokerPositionSnapshot, HistoricalStockBars, OpenBrokerOrder } from "./alpaca.server.ts";
+import { ALPACA_PAPER_BASE_URL, AlpacaTransportError, type AlpacaConfig } from "./alpaca.server.ts";
+import { ALPACA_WORKER_ASSET, AlpacaPaperWorker, MemoryAlpacaWorkerStore, alpacaPaperWorkerKey, deterministicClientOrderId, deterministicDecisionId, dispatchBlockReasonFor, isRegularUsEquitySession } from "./alpaca-worker.server.ts";
+import { BOUNDED_US_EQUITY_ASSETS, SPY_SPEC } from "./assets.ts";
+import { workerRuntimeIdentityFor } from "./runtime-identity.ts";
 import type { MarketSource } from "./market.ts";
 import type { ExecutionIntent } from "./types.ts";
 
@@ -20,6 +22,7 @@ class FakeBroker {
   openOrderCalls = 0;
   posts = 0;
   positionQuantity = 0;
+  positionSymbol = "SPY";
   equity = 100_000;
   throwAccount = false;
   throwPosition = false;
@@ -36,7 +39,7 @@ class FakeBroker {
   async position(): Promise<BrokerPositionSnapshot> {
     this.positionCalls += 1;
     if (this.throwPosition) throw new Error("POSITION_UNAVAILABLE");
-    return { symbol: "SPY", quantity: this.positionQuantity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_RECONCILED" };
+    return { symbol: this.positionSymbol, quantity: this.positionQuantity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_RECONCILED" };
   }
   async openOrders(): Promise<OpenBrokerOrder[]> {
     this.openOrderCalls += 1;
@@ -116,8 +119,31 @@ function rawBars(decisionBuckets = 28): Array<{ t: number; open: number; high: n
   return bars;
 }
 
-function worker(store: MemoryAlpacaWorkerStore, broker: FakeBroker, updates?: FakeTradeUpdates, inSession = true) {
-  return new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, isRegularSession: () => inSession });
+const fixtureNow = () => new Date(rawBars().at(-1)!.t + 60_000);
+
+function worker(store: MemoryAlpacaWorkerStore, broker: FakeBroker, updates?: FakeTradeUpdates, inSession = true, historicalBars?: HistoricalStockBars, now?: () => Date) {
+  return new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, historicalBars, now: now ?? fixtureNow, isRegularSession: () => inSession });
+}
+
+class FakeHistoricalBars implements HistoricalStockBars {
+  requests: Array<{ symbol: "SPY"; start: number; end: number }> = [];
+  private readonly response: (start: number, end: number) => Array<{ t: number; open: number; high: number; low: number; close: number; volume: number }>;
+  constructor(response: (start: number, end: number) => Array<{ t: number; open: number; high: number; low: number; close: number; volume: number }>) { this.response = response; }
+  async bars(request: { symbol: "SPY"; start: number; end: number }) {
+    this.requests.push(request);
+    return this.response(request.start, request.end);
+  }
+}
+
+class ConflictingHistoricalRecoveryStore extends MemoryAlpacaWorkerStore {
+  override async recordMarketBar(observation: Parameters<MemoryAlpacaWorkerStore["recordMarketBar"]>[0]) {
+    if (observation.origin === "REST_BACKFILL") return "CONFLICT" as const;
+    return super.recordMarketBar(observation);
+  }
+}
+
+async function persistDurableBars(store: MemoryAlpacaWorkerStore, bars: Array<{ t: number; open: number; high: number; low: number; close: number; volume: number }>): Promise<void> {
+  for (const bar of bars) await store.insertClosedBar("SPY", bar);
 }
 
 class ManualMarketSource implements MarketSource {
@@ -136,13 +162,230 @@ class ManualMarketSource implements MarketSource {
 
 const flush = async () => new Promise<void>((resolve) => setImmediate(resolve));
 
+async function processLiveBars(target: AlpacaPaperWorker, bars = rawBars()): Promise<void> {
+  const fixture = target as unknown as { options: { now?: () => Date } };
+  for (const bar of bars) {
+    fixture.options.now = () => new Date(bar.t + 60_000);
+    await target.processRawBar(bar);
+  }
+}
+
 async function runToDispatch(target: AlpacaPaperWorker, broker: FakeBroker) {
   await target.start();
-  for (const bar of rawBars()) await target.processRawBar(bar);
+  await processLiveBars(target);
   assert.ok(broker.posts > 0, "fixture must produce at least one Arm C paper dispatch after warmup");
 }
 
 describe("Alpaca PAPER worker restart and authority invariants", () => {
+  it("persists STARTING, RECONCILING, and READY in order only after startup gates pass", async () => {
+    const store = new MemoryAlpacaWorkerStore();
+    const broker = new FakeBroker();
+    let releaseAccount!: () => void;
+    let enteredAccount!: () => void;
+    const accountEntered = new Promise<void>((resolve) => { enteredAccount = resolve; });
+    const accountGate = new Promise<void>((resolve) => { releaseAccount = resolve; });
+    const gatedBroker = Object.assign(Object.create(broker) as FakeBroker, {
+      async account() {
+        broker.accountCalls += 1;
+        enteredAccount();
+        await accountGate;
+        return { equity: broker.equity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_PAPER_ACCOUNT" as const };
+      },
+    });
+    const target = worker(store, gatedBroker);
+    const starting = target.start();
+    await accountEntered;
+    const inProgress = store.allRunEvidence()[0]!;
+    assert.equal(inProgress.state, "RECONCILING");
+    assert.deepEqual(store.runTransitions.map(({ state }) => state), ["STARTING", "RECONCILING"]);
+    releaseAccount();
+    await starting;
+    const run = store.allRunEvidence()[0]!;
+    assert.equal(run.state, "READY");
+    assert.deepEqual(store.runTransitions.map(({ state }) => state), ["STARTING", "RECONCILING", "READY"]);
+    assert.equal(broker.posts, 0, "persisting READY performs no broker order submission");
+    await target.stop();
+    assert.equal(store.runEvidence(run.runId)?.state, "STOPPED");
+    assert.ok(store.runEvidence(run.runId)?.stoppedAt);
+  });
+
+  it("persists HALTED on reconciliation failure and STOPPED when shutdown interrupts reconciliation", async () => {
+    const failedStore = new MemoryAlpacaWorkerStore();
+    const failedBroker = new FakeBroker(); failedBroker.throwAccount = true;
+    const failed = worker(failedStore, failedBroker);
+    await failed.start();
+    const haltedRun = failedStore.allRunEvidence()[0]!;
+    assert.equal(haltedRun.state, "HALTED");
+    assert.equal(haltedRun.haltReason, "ACCOUNT_UNAVAILABLE");
+    assert.ok(haltedRun.stoppedAt);
+
+    const store = new MemoryAlpacaWorkerStore();
+    const broker = new FakeBroker();
+    let releaseAccount!: () => void;
+    let enteredAccount!: () => void;
+    const accountEntered = new Promise<void>((resolve) => { enteredAccount = resolve; });
+    const accountGate = new Promise<void>((resolve) => { releaseAccount = resolve; });
+    const gatedBroker = Object.assign(Object.create(broker) as FakeBroker, {
+      async account() {
+        broker.accountCalls += 1;
+        enteredAccount();
+        await accountGate;
+        return { equity: broker.equity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_PAPER_ACCOUNT" as const };
+      },
+    });
+    const target = worker(store, gatedBroker);
+    const starting = target.start();
+    await accountEntered;
+    const runId = store.allRunEvidence()[0]!.runId;
+    assert.equal(store.runEvidence(runId)?.state, "RECONCILING");
+    await target.stop();
+    releaseAccount();
+    await starting;
+    const stopped = store.runEvidence(runId)!;
+    assert.equal(stopped.state, "STOPPED");
+    assert.ok(stopped.stoppedAt);
+    assert.equal(store.runTransitions.filter(({ state }) => state === "READY").length, 0);
+  });
+
+  it("fails closed when persisting a lifecycle transition fails", async () => {
+    const store = new MemoryAlpacaWorkerStore();
+    const persistRun = store.updateRun.bind(store);
+    let failReconciliationTransition = true;
+    store.updateRun = async (runId, state, haltReason) => {
+      if (state === "RECONCILING" && failReconciliationTransition) {
+        failReconciliationTransition = false;
+        throw new Error("RUN_STATE_WRITE_FAILED");
+      }
+      await persistRun(runId, state, haltReason);
+    };
+    const broker = new FakeBroker();
+    const updates = new FakeTradeUpdates();
+    const target = worker(store, broker, updates);
+    await target.start();
+    assert.equal(target.snapshot().workerState, "HALTED");
+    assert.equal(broker.accountCalls, 0, "failed RECONCILING persistence prevents broker reconciliation");
+    assert.equal(updates.connects, 0, "failed lifecycle persistence never opens trade updates");
+    assert.equal(broker.posts, 0);
+    assert.equal(store.allRunEvidence()[0]?.state, "HALTED");
+    assert.equal(store.allRunEvidence()[0]?.haltReason, "RUN_STATE_WRITE_FAILED");
+    assert.ok(store.allRunEvidence()[0]?.stoppedAt);
+  });
+
+  it("creates distinct run evidence on restart and prevents a superseded predecessor from regressing", async () => {
+    const store = new MemoryAlpacaWorkerStore();
+    const broker = new FakeBroker();
+    const first = worker(store, broker);
+    await first.start();
+    const firstRunId = store.allRunEvidence()[0]!.runId;
+    await first.stop();
+    const second = worker(store, broker);
+    await second.start();
+    const runs = store.allRunEvidence();
+    assert.equal(runs.length, 2);
+    assert.notEqual(runs[0]!.runId, runs[1]!.runId);
+    assert.equal(store.runEvidence(firstRunId)?.state, "STOPPED", "restart preserves terminal predecessor evidence");
+    await second.stop();
+
+    const takeover = new MemoryAlpacaWorkerStore();
+    const priorRun = "prior-run"; const successorRun = "successor-run"; const key = "test-worker";
+    await takeover.createRun(priorRun, key, "READY");
+    const priorLease = await takeover.acquireOwnership(key, priorRun, 30);
+    assert.ok(priorLease);
+    await takeover.releaseOwnership(priorLease);
+    await takeover.createRun(successorRun, key, "STARTING");
+    assert.ok(await takeover.acquireOwnership(key, successorRun, 30));
+    const superseded = takeover.runEvidence(priorRun)!;
+    assert.equal(superseded.state, "SUPERSEDED");
+    assert.equal(superseded.supersededByRunId, successorRun);
+    assert.ok(superseded.stoppedAt && superseded.supersededAt && superseded.supersedeReason);
+    await assert.rejects(() => takeover.updateRun(priorRun, "READY", null), /WORKER_RUN_LIFECYCLE_UPDATE_REJECTED/);
+    await assert.rejects(() => takeover.updateRun(priorRun, "RECONCILING", null), /WORKER_RUN_LIFECYCLE_UPDATE_REJECTED/);
+    await assert.rejects(() => takeover.updateRun(priorRun, "STOPPED", null), /WORKER_RUN_LIFECYCLE_UPDATE_REJECTED/);
+    assert.equal(takeover.runEvidence(priorRun)?.state, "SUPERSEDED");
+    assert.equal(takeover.runTransitions.filter(({ runId, state }) => runId === priorRun && state === "SUPERSEDED").length, 1);
+  });
+
+  it("stops a predecessor whose lease is taken over during asynchronous startup", async () => {
+    const store = new MemoryAlpacaWorkerStore();
+    const broker = new FakeBroker();
+    let releaseAccount!: () => void;
+    let enteredAccount!: () => void;
+    const accountEntered = new Promise<void>((resolve) => { enteredAccount = resolve; });
+    const accountGate = new Promise<void>((resolve) => { releaseAccount = resolve; });
+    const gatedBroker = Object.assign(Object.create(broker) as FakeBroker, {
+      async account() {
+        broker.accountCalls += 1;
+        enteredAccount();
+        await accountGate;
+        return { equity: broker.equity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_PAPER_ACCOUNT" as const };
+      },
+    });
+    const updates = new FakeTradeUpdates();
+    const predecessor = worker(store, gatedBroker, updates);
+    const starting = predecessor.start();
+    await accountEntered;
+    const oldRun = store.allRunEvidence()[0]!;
+    const oldLease = store.leaseEvidence(oldRun.workerKey)!;
+    await store.releaseOwnership(oldLease);
+    const successorRun = "successor-after-startup-race";
+    await store.createRun(successorRun, oldRun.workerKey, "STARTING");
+    assert.ok(await store.acquireOwnership(oldRun.workerKey, successorRun, 30));
+    await predecessor.stop();
+    releaseAccount();
+    await starting;
+    assert.equal(store.runEvidence(oldRun.runId)?.state, "SUPERSEDED");
+    assert.equal(store.runEvidence(oldRun.runId)?.supersededByRunId, successorRun);
+    assert.equal(predecessor.snapshot().workerState, "STOPPED");
+    assert.equal(updates.connects, 0);
+  });
+
+  it("applies stale-bar, reconciliation, and ownership gates to both SPY dispatch arms", () => {
+    const healthy = {
+      dispatchCapable: true,
+      inSession: true,
+      warmupComplete: true,
+      featureContinuity: "HEALTHY" as const,
+      recoveryState: "HEALTHY" as const,
+      latestLiveBarStale: false,
+      reconciliationComplete: true,
+      hasOwnership: true,
+    };
+    for (const arm of ["ema_trend_arm_c", "ema_rsi_v1"] as const) {
+      const identity = workerRuntimeIdentityFor(SPY_SPEC, arm);
+      assert.equal(identity.capability.kind, "DISPATCH_CAPABLE");
+      assert.equal(dispatchBlockReasonFor({ ...healthy, latestLiveBarStale: true }), "LATEST_LIVE_BAR_STALE", `${arm} stale live bar`);
+      assert.equal(dispatchBlockReasonFor({ ...healthy, reconciliationComplete: false }), "BROKER_RECONCILIATION_INCOMPLETE", `${arm} reconciliation`);
+      assert.equal(dispatchBlockReasonFor({ ...healthy, hasOwnership: false }), "DISPATCH_OWNERSHIP_REQUIRED", `${arm} ownership`);
+      assert.equal(dispatchBlockReasonFor(healthy), null, `${arm} healthy dispatch`);
+    }
+  });
+
+  it("keeps read-only durable symbols evidence-only without broker reconciliation, trade updates, or POSTs", async () => {
+    const readOnlyAssets = BOUNDED_US_EQUITY_ASSETS.filter((asset) => asset.symbol !== "SPY");
+    for (const arm of ["ema_trend_arm_c", "ema_rsi_v1"] as const) {
+      for (const asset of readOnlyAssets) {
+        const store = new MemoryAlpacaWorkerStore();
+        const broker = new FakeBroker();
+        const updates = new FakeTradeUpdates();
+        const target = new AlpacaPaperWorker({
+          config: { ...config, symbol: asset.symbol }, asset, arm, store, broker, tradeUpdates: updates,
+          isRegularSession: () => true,
+          now: () => new Date(rawBars(45).at(-1)!.t + 60_000),
+        });
+        await target.start();
+        for (const bar of rawBars(45)) await target.processRawBar(bar);
+        assert.equal(target.snapshot().runtimeCapability, "READ_ONLY_DURABLE", `${asset.symbol} ${arm}`);
+        assert.ok(store.decisionCount() > 0, `${asset.symbol} ${arm} produces research evidence`);
+        assert.equal(broker.accountCalls, 0, `${asset.symbol} ${arm} never reconciles broker account`);
+        assert.equal(broker.positionCalls, 0, `${asset.symbol} ${arm} never reconciles broker position`);
+        assert.equal(updates.connects, 0, `${asset.symbol} ${arm} never connects trade_updates`);
+        assert.equal(broker.posts, 0, `${asset.symbol} ${arm} cannot broker POST`);
+        assert.ok((await store.listIntents(asset.symbol, target.snapshot().workerKey)).every((row) => row.dispatchBlockReason === "READ_ONLY_RUNTIME"));
+        await target.stop();
+      }
+    }
+  });
+
   it("deduplicates raw bars and completed decision bars", async () => {
     const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
     await target.start();
@@ -216,7 +459,7 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     const submitted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
     await store.putIntent({ ...submitted, status: "SUBMISSION_ATTEMPTED" });
     const clientOrderId = submitted.clientOrderId!;
-    broker.found.set(clientOrderId, { decisionId: submitted.decisionId, intentId: submitted.intentId, clientOrderId, brokerOrderId: "adopted-attempt", status: "ACCEPTED", updatedAt: "2026-09-19T14:00:00.000Z", rawStatus: "accepted", lookup: "FOUND" });
+    broker.found.set(clientOrderId, { decisionId: submitted.decisionId, intentId: submitted.intentId, clientOrderId, brokerOrderId: "broker-1", status: "ACCEPTED", updatedAt: "2026-09-19T14:00:00.000Z", rawStatus: "accepted", lookup: "FOUND" });
     const posts = broker.posts;
     await first.stop(); const recreated = worker(store, broker); await recreated.start();
     assert.equal(recreated.snapshot().workerState, "READY");
@@ -231,22 +474,26 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
 
     const unavailableStore = new MemoryAlpacaWorkerStore(); const unavailableBroker = new FakeBroker();
     const unavailable = worker(unavailableStore, unavailableBroker); await unavailable.start(); unavailableBroker.throwPosition = true;
-    for (const bar of rawBars()) await unavailable.processRawBar(bar);
+    await processLiveBars(unavailable);
     assert.equal(unavailable.snapshot().workerState, "HALTED"); assert.equal(unavailableBroker.posts, 0);
+
+    const wrongSymbolStore = new MemoryAlpacaWorkerStore(); const wrongSymbolBroker = new FakeBroker(); wrongSymbolBroker.positionSymbol = "QQQ";
+    const wrongSymbol = worker(wrongSymbolStore, wrongSymbolBroker); await wrongSymbol.start();
+    assert.equal(wrongSymbol.snapshot().workerState, "HALTED", "SPY worker rejects a non-SPY broker position");
 
     const conflictStore = new MemoryAlpacaWorkerStore(); const conflictBroker = new FakeBroker(); conflictBroker.openOnDispatch = true;
     const conflictWorker = worker(conflictStore, conflictBroker); await conflictWorker.start();
-    for (const bar of rawBars()) await conflictWorker.processRawBar(bar);
+    await processLiveBars(conflictWorker);
     assert.equal(conflictBroker.posts, 0);
     assert.ok((await conflictStore.listIntents()).some((row) => row.dispatchBlockReason === "OPEN_ORDER_CONFLICT"));
   });
 
   it("persists trade updates, reconciles after stream loss, and never dispatches outside the exchange session", async () => {
     const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const updates = new FakeTradeUpdates();
-    const target = new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, isRegularSession: () => true, sleep: async () => undefined });
+    const target = new AlpacaPaperWorker({ config, store, broker, tradeUpdates: updates, isRegularSession: () => true, now: fixtureNow, sleep: async () => undefined });
     await runToDispatch(target, broker);
     const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
-    await target.processTradeUpdate({ stream: "trade_updates", data: { event: "fill", order: { id: "broker-1", status: "filled", client_order_id: accepted.clientOrderId } } });
+    await target.processTradeUpdate({ stream: "trade_updates", data: { event: "fill", order: { id: "broker-1", status: "filled", symbol: "SPY", client_order_id: accepted.clientOrderId } } });
     assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
     const accountCalls = broker.accountCalls;
     await target.handleTradeStreamError(new Error("socket lost"));
@@ -259,13 +506,147 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     assert.ok((await outStore.listIntents()).some((row) => row.dispatchBlockReason === "OUTSIDE_REGULAR_SESSION"));
   });
 
+  it("converges an ACCEPTED intent on fill and ignores duplicate, replayed, and late nonterminal updates", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
+    await runToDispatch(target, broker);
+    const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    const update = { stream: "trade_updates", data: { event: "fill", order: { id: "broker-1", status: "filled", symbol: "SPY", client_order_id: accepted.clientOrderId } } };
+    const posts = broker.posts;
+    await target.processTradeUpdate(update);
+    await target.processTradeUpdate(update);
+    await target.processTradeUpdate({ ...update, data: { event: "new", order: { ...update.data.order, status: "new" } } });
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
+    assert.equal(store.updates.length, 3, "all stream observations remain durable evidence");
+    assert.equal(store.posts.filter((state) => state.intentId === accepted.intentId && state.status === "FILLED").length, 2);
+    assert.equal(broker.posts, posts, "trade updates never authorize another POST");
+    await target.stop();
+    const recreated = worker(store, broker); await recreated.start();
+    await recreated.processTradeUpdate(update);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
+    assert.equal(broker.posts, posts);
+  });
+
+  it("adopts broker-authoritative FILLED from SUBMISSION_ATTEMPTED without reposting", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const submitted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    await store.putIntent({ ...submitted, status: "SUBMISSION_ATTEMPTED" });
+    broker.found.set(submitted.clientOrderId!, { decisionId: submitted.decisionId, intentId: submitted.intentId, clientOrderId: submitted.clientOrderId!, brokerOrderId: "broker-1", status: "FILLED", updatedAt: "2026-09-22T14:00:00.000Z", rawStatus: "filled", lookup: "FOUND" });
+    const posts = broker.posts;
+    await first.stop(); const recreated = worker(store, broker); await recreated.start();
+    assert.equal(recreated.snapshot().workerState, "READY");
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === submitted.intentId)?.intent.status, "FILLED");
+    assert.equal(broker.posts, posts);
+  });
+
+  it("terminalizes a no-op position match after the fenced claim and stays restartable", async () => {
+    class NoOpBroker extends FakeBroker {
+      override async submit(intent: ExecutionIntent): Promise<BrokerOrderState> {
+        this.posts += 1;
+        return { decisionId: intent.decisionId, intentId: intent.intentId, clientOrderId: intent.clientOrderId!, brokerOrderId: null, status: "CANCELLED", updatedAt: null, rawStatus: null, lookup: "ABSENT" };
+      }
+    }
+    const store = new MemoryAlpacaWorkerStore(); const broker = new NoOpBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const noOp = (await store.listIntents()).find(({ intent }) => intent.status === "CANCELLED" && store.posts.some((state) => state.intentId === intent.intentId && state.lookup === "ABSENT" && state.status === "CANCELLED"));
+    assert.ok(noOp, "position match should finish the claimed intent without an order");
+    const submits = broker.posts;
+    await first.stop(); const recreated = worker(store, broker); await recreated.start();
+    assert.equal(recreated.snapshot().workerState, "READY");
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === noOp.intent.intentId)?.intent.status, "CANCELLED");
+    assert.equal(broker.posts, submits);
+  });
+
+  it("keeps partial fills nonterminal and preserves canceled, rejected, expired, and done-for-day semantics", async () => {
+    for (const [event, expected] of [["canceled", "CANCELLED"], ["rejected", "REJECTED"], ["expired", "CANCELLED"], ["done_for_day", "CANCELLED"]] as const) {
+      const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
+      await runToDispatch(target, broker);
+      const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+      const order = { id: "broker-1", symbol: "SPY", client_order_id: accepted.clientOrderId };
+      await target.processTradeUpdate({ stream: "trade_updates", data: { event: "partial_fill", order: { ...order, status: "partially_filled" } } });
+      assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "PARTIALLY_FILLED");
+      await target.processTradeUpdate({ stream: "trade_updates", data: { event, order: { ...order, status: event } } });
+      assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, expected);
+      await target.processTradeUpdate({ stream: "trade_updates", data: { event: "partial_fill", order: { ...order, status: "partially_filled" } } });
+      assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, expected);
+    }
+  });
+
+  it("persists but cannot apply unknown, malformed, wrong-symbol, or wrong-order updates", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
+    await runToDispatch(target, broker);
+    const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    const order = { id: "broker-1", status: "filled", symbol: "SPY", client_order_id: accepted.clientOrderId };
+    const posts = broker.posts;
+    const invalid = [
+      { stream: "trade_updates", data: { event: "fill", order: { ...order, client_order_id: "unknown-client-order" } } },
+      { stream: "trade_updates", data: { event: "fill", order: { ...order, symbol: "QQQ" } } },
+      { stream: "trade_updates", data: { event: "fill", order: { ...order, id: "" } } },
+      { stream: "trade_updates", data: { event: "fill", order: null } },
+      { stream: "trade_updates", data: { event: "partial_fill", order: { ...order, status: "partially_filled" } } },
+    ];
+    for (const update of invalid.slice(0, 4)) await target.processTradeUpdate(update);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "ACCEPTED");
+    await target.processTradeUpdate(invalid[4]!);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "PARTIALLY_FILLED");
+    await assert.rejects(() => target.processTradeUpdate({ stream: "trade_updates", data: { event: "fill", order: { ...order, id: "another-order" } } }), /CORRELATION_LOST/);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "PARTIALLY_FILLED");
+    assert.equal(store.updates.length, 6);
+    assert.equal(broker.posts, posts);
+  });
+
+  it("repairs the September 22 FILLED broker and trade evidence with stale ACCEPTED projection on restart", async () => {
+    const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "fixtures/paper-fill-stale-accepted.json"), "utf8")) as {
+      observedAt: string; intentStatus: "ACCEPTED"; brokerOrder: Pick<BrokerOrderState, "brokerOrderId" | "status" | "rawStatus" | "lookup">;
+      tradeUpdate: { stream: string; data: { event: string; order: { id: string; client_order_id: string; symbol: string; status: string } } };
+    };
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const accepted = (await store.listIntents()).find(({ intent }) => intent.status === fixture.intentStatus)!.intent;
+    const filled = { ...fixture.brokerOrder, decisionId: accepted.decisionId, intentId: accepted.intentId, clientOrderId: accepted.clientOrderId!, updatedAt: fixture.observedAt };
+    store.posts.push(filled);
+    store.updates.push({ update: { ...fixture.tradeUpdate, data: { ...fixture.tradeUpdate.data, order: { ...fixture.tradeUpdate.data.order, client_order_id: accepted.clientOrderId! } } }, clientOrderId: accepted.clientOrderId! });
+    broker.found.set(accepted.clientOrderId!, filled);
+    const posts = broker.posts; const observations = [...store.posts]; const updates = store.updates.length;
+    await first.stop(); const recreated = worker(store, broker); await recreated.start();
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "FILLED");
+    assert.deepEqual(store.posts.slice(0, observations.length), observations, "reconciliation retains prior broker evidence");
+    assert.ok(store.posts.length > observations.length, "reconciliation appends broker evidence");
+    assert.equal(store.updates.length, updates, "persisted fill update stays intact");
+    assert.equal(broker.posts, posts);
+  });
+
+  it("does not let a stale fence project a fill or claim POST authority", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const first = worker(store, broker);
+    await runToDispatch(first, broker);
+    const accepted = (await store.listIntents()).find(({ intent }) => intent.status === "ACCEPTED")!.intent;
+    const postCount = broker.posts;
+    await first.stop();
+    const key = alpacaPaperWorkerKey();
+    const scope = { workerKey: key, asset: { symbol: "SPY" } };
+    const oldLease = await store.acquireOwnership(key, "old-run", 30);
+    assert.ok(oldLease);
+    await store.releaseOwnership(oldLease);
+    const currentLease = await store.acquireOwnership(key, "current-run", 30);
+    assert.ok(currentLease);
+    const filled = { decisionId: accepted.decisionId, intentId: accepted.intentId, clientOrderId: accepted.clientOrderId!, brokerOrderId: "broker-1", status: "FILLED" as const, updatedAt: "2026-09-22T14:00:00.000Z", rawStatus: "filled", lookup: "FOUND" as const };
+    const evidenceCount = store.posts.length;
+    assert.equal(await store.recordBrokerOrder(oldLease, scope, filled), null);
+    assert.equal(store.posts.length, evidenceCount);
+    assert.equal((await store.listIntents()).find(({ intent }) => intent.intentId === accepted.intentId)?.intent.status, "ACCEPTED");
+    await store.putIntent({ ...accepted, status: "PENDING" });
+    assert.equal(await store.claimIntentForDispatch(oldLease, { ...accepted, status: "PENDING" }, scope), false);
+    assert.equal(await store.claimIntentForDispatch(currentLease, { ...accepted, status: "PENDING" }, scope), true);
+    assert.equal(broker.posts, postCount, "a claim alone does not POST an order");
+  });
+
   it("bounds trade-stream recovery, reconciles before replacement, and preserves decision/submission idempotency", async () => {
     const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const updates = new FakeTradeUpdates();
     const backoffs: Array<{ delay: number; resolve: () => void }> = [];
     const target = new AlpacaPaperWorker({
       config, store, broker, tradeUpdates: updates, isRegularSession: () => true,
       reconnectDelayMs: (attempt) => attempt * 10,
-      sleep: (delay) => new Promise<void>((resolve) => { backoffs.push({ delay, resolve }); }),
+      now: fixtureNow, sleep: (delay) => new Promise<void>((resolve) => { backoffs.push({ delay, resolve }); }),
     });
     await runToDispatch(target, broker);
     const decisions = store.decisionCount(); const posts = broker.posts;
@@ -348,6 +729,12 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     const timestamp = Date.parse("2026-09-21T13:30:00.000Z"); const id = deterministicDecisionId(timestamp);
     assert.equal(id, deterministicDecisionId(timestamp));
     assert.equal(deterministicClientOrderId(id), deterministicClientOrderId(id));
+    assert.equal(alpacaPaperWorkerKey(), "alpaca-paper:SPY:15Min:alpaca-paper-worker-v1");
+    assert.equal(alpacaPaperWorkerKey(ALPACA_WORKER_ASSET), alpacaPaperWorkerKey());
+    const target = worker(new MemoryAlpacaWorkerStore(), new FakeBroker());
+    assert.equal(target.snapshot().symbol, "SPY");
+    assert.equal(target.snapshot().feed, "iex");
+    assert.equal(target.snapshot().decisionTimeframe, "15Min");
   });
 
   it("uses the exact New York completed-bucket boundary", () => {
@@ -402,28 +789,144 @@ describe("Alpaca PAPER worker restart and authority invariants", () => {
     assert.equal(legacy.snapshot().workerState, "HALTED", "legacy checkpoint cannot silently reset paper-equity high-water");
   });
 
-  it("invalidates feature continuity after a missing bucket and resumes only after fresh warmup", async () => {
-    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker(); const target = worker(store, broker);
+  it("repairs an exact 1m gap with REST provenance without retroactive dispatch", async () => {
+    const bars = rawBars(30); const missing = bars[24 * 15 + 4]!;
+    const historical = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const store = new MemoryAlpacaWorkerStore(); const broker = new FakeBroker();
+    const target = worker(store, broker, undefined, true, historical, () => new Date(missing.t + 2 * 60_000));
     await target.start();
-    const bars = rawBars(60);
-    const start = bars[0]!.t;
-    const missingBucketStart = start + 2 * 15 * 60_000;
-    for (const bar of bars.filter((bar) => bar.t < missingBucketStart || bar.t >= missingBucketStart + 15 * 60_000)) await target.processRawBar(bar);
-    assert.ok(target.snapshot().missingDecisionBuckets > 0);
-    assert.equal(target.snapshot().featureContinuity, "HEALTHY", "enough post-gap continuous bars rebuild warmup");
-    const firstAfterGap = store.decisionEvidence().find((evidence) => evidence.timestamp === missingBucketStart + 15 * 60_000);
-    assert.equal(firstAfterGap?.features.logReturn, 0, "the first post-gap return never bridges to pre-gap close");
-    assert.equal(firstAfterGap?.barIndex, 0, "post-gap feature indexing restarts rather than inheriting pre-gap history");
+    for (const bar of bars.filter((bar) => bar.t < missing.t)) await target.processRawBar(bar);
+    const postsBeforeRepair = broker.posts;
+    for (const bar of bars.filter((bar) => bar.t > missing.t && bar.t <= missing.t + 60_000)) await target.processRawBar(bar);
+    assert.deepEqual(historical.requests, [{ symbol: "SPY", start: missing.t, end: missing.t + 60_000 }]);
+    assert.equal(target.snapshot().recoveryState, "HEALTHY");
+    assert.equal(target.snapshot().featureContinuity, "HEALTHY");
+    assert.equal(broker.posts, postsBeforeRepair, "the repaired historical bucket cannot dispatch");
+    const observation = store.marketObservations().find((item) => item.origin === "REST_BACKFILL");
+    assert.equal(observation?.verificationResult, "ACCEPTED");
+    assert.equal(observation?.bar.t, missing.t);
+    assert.equal(observation?.providerEventTimestampMs, missing.t);
+    assert.equal(observation?.observedAt, new Date(missing.t + 2 * 60_000).toISOString());
+    assert.ok(observation?.recoveryAttemptId);
+    assert.equal(store.recoveryAttempt(observation!.recoveryAttemptId!)?.result, "VERIFIED");
 
-    const rebuildingStore = new MemoryAlpacaWorkerStore(); const rebuildingBroker = new FakeBroker(); const rebuilding = worker(rebuildingStore, rebuildingBroker);
-    await rebuilding.start();
-    const shortBars = rawBars(20).filter((bar) => bar.t < missingBucketStart || bar.t >= missingBucketStart + 15 * 60_000);
-    for (const bar of shortBars) await rebuilding.processRawBar(bar);
-    assert.equal(rebuilding.snapshot().featureContinuity, "REBUILDING"); assert.equal(rebuildingBroker.posts, 0, "dispatch remains blocked while warmup rebuilds");
-    await rebuilding.stop();
-    const resumed = worker(rebuildingStore, rebuildingBroker); await resumed.start();
-    for (const bar of bars.filter((bar) => bar.t > shortBars.at(-1)!.t && (bar.t < missingBucketStart || bar.t >= missingBucketStart + 15 * 60_000))) await resumed.processRawBar(bar);
-    assert.equal(resumed.snapshot().featureContinuity, "HEALTHY"); assert.ok(rebuildingBroker.posts > 0, "only post-gap warmup can restore dispatch");
+    for (const bar of bars.filter((bar) => bar.t > missing.t + 60_000)) await target.processRawBar(bar);
+    assert.ok(broker.posts > postsBeforeRepair, "a subsequent live bucket may use repaired history");
+  });
+
+  it("repairs one durable restart gap, restores continuity, and defers dispatch until a future live bucket", async () => {
+    const bars = rawBars(24); const durableLatest = bars.at(-1)!; const missing = bars[10 * 15 + 4]!;
+    const store = new MemoryAlpacaWorkerStore();
+    await persistDurableBars(store, bars.filter((bar) => bar.t !== missing.t));
+    const broker = new FakeBroker();
+    const historical = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const now = () => new Date(durableLatest.t + 2 * 60_000);
+    const restarted = worker(store, broker, undefined, true, historical, now);
+
+    await restarted.start();
+
+    assert.deepEqual(historical.requests, [{ symbol: "SPY", start: missing.t, end: missing.t + 60_000 }]);
+    assert.equal(restarted.snapshot().featureContinuity, "HEALTHY");
+    assert.equal(restarted.snapshot().recoveryState, "HEALTHY");
+    assert.equal(broker.posts, 0, "startup repair never creates a retroactive broker POST");
+    assert.equal(store.decisionCount(), 0, "startup repair never creates retroactive decisions");
+    const repaired = store.marketObservations().find((observation) => observation.origin === "REST_BACKFILL");
+    assert.equal(repaired?.bar.t, missing.t);
+    assert.equal(repaired?.verificationResult, "ACCEPTED");
+
+    const nextDispatchBarrier = durableLatest.t + 15 * 60_000;
+    for (const bar of rawBars(26).filter((bar) => bar.t > durableLatest.t && bar.t < durableLatest.t + 30 * 60_000)) await restarted.processRawBar(bar);
+    assert.ok(broker.posts > 0, "a future live bucket may dispatch after verification completes");
+    assert.ok(store.decisionEvidence().every((evidence) => evidence.timestamp >= nextDispatchBarrier), "only a future live bucket becomes dispatch-eligible");
+  });
+
+  it("repairs separated durable restart gaps oldest-first", async () => {
+    const bars = rawBars(24); const first = bars[10 * 15 + 4]!; const second = bars[13 * 15 + 7]!;
+    const firstEnd = first.t + 2 * 60_000; const secondEnd = second.t + 3 * 60_000;
+    const store = new MemoryAlpacaWorkerStore();
+    await persistDurableBars(store, bars.filter((bar) =>
+      (bar.t < first.t || bar.t >= firstEnd) && (bar.t < second.t || bar.t >= secondEnd)));
+    const historical = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const target = worker(store, new FakeBroker(), undefined, true, historical, () => new Date(bars.at(-1)!.t + 2 * 60_000));
+
+    await target.start();
+
+    assert.deepEqual(historical.requests, [
+      { symbol: "SPY", start: first.t, end: firstEnd },
+      { symbol: "SPY", start: second.t, end: secondEnd },
+    ]);
+    assert.equal(target.snapshot().featureContinuity, "HEALTHY");
+    assert.equal(target.snapshot().recoveryState, "HEALTHY");
+  });
+
+  it("keeps startup recovery fail-closed for partial, conflicting, and unavailable history", async () => {
+    const bars = rawBars(24); const first = bars[22 * 15 + 4]!; const second = bars[22 * 15 + 5]!;
+    const partialStore = new MemoryAlpacaWorkerStore();
+    await persistDurableBars(partialStore, bars.filter((bar) => bar.t !== first.t && bar.t !== second.t));
+    const partial = new FakeHistoricalBars((start) => [bars.find((bar) => bar.t === start)!]);
+    const partialBroker = new FakeBroker();
+    const partialWorker = worker(partialStore, partialBroker, undefined, true, partial, () => new Date(bars.at(-1)!.t + 2 * 60_000));
+    await partialWorker.start();
+    assert.equal(partialWorker.snapshot().recoveryState, "REBUILDING");
+    assert.equal(partialWorker.snapshot().featureContinuity, "REBUILDING");
+    assert.equal(partialBroker.posts, 0);
+
+    const conflictStore = new ConflictingHistoricalRecoveryStore();
+    await persistDurableBars(conflictStore, bars.filter((bar) => bar.t !== first.t));
+    const conflictBroker = new FakeBroker();
+    const conflict = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const conflictWorker = worker(conflictStore, conflictBroker, undefined, true, conflict, () => new Date(bars.at(-1)!.t + 2 * 60_000));
+    await conflictWorker.start();
+    assert.equal(conflictWorker.snapshot().recoveryState, "REBUILDING");
+    assert.equal(conflictWorker.snapshot().featureContinuity, "REBUILDING");
+    assert.equal(conflictBroker.posts, 0);
+
+    const unavailableStore = new MemoryAlpacaWorkerStore();
+    await persistDurableBars(unavailableStore, bars.filter((bar) => bar.t !== first.t));
+    const unavailable = new FakeHistoricalBars(() => { throw new AlpacaTransportError("PROTOCOL_FAILURE", "safe test failure"); });
+    const unavailableWorker = worker(unavailableStore, new FakeBroker(), undefined, true, unavailable, () => new Date(bars.at(-1)!.t + 2 * 60_000));
+    await unavailableWorker.start();
+    assert.equal(unavailableWorker.snapshot().recoveryState, "REBUILDING");
+    assert.equal(unavailableWorker.snapshot().featureContinuity, "REBUILDING");
+    const failedAttempt = unavailableStore.recoveryAttempt(unavailableWorker.snapshot().recoveryAttemptId!);
+    assert.equal(failedAttempt?.result, "BACKFILL_REQUEST_FAILED");
+    assert.equal(failedAttempt?.reason, "PROTOCOL_FAILURE");
+  });
+
+  it("keeps dispatch blocked for partial multi-minute backfill and fails closed on conflicts", async () => {
+    const bars = rawBars(30); const first = bars[24 * 15 + 4]!; const second = bars[24 * 15 + 5]!;
+    const partial = new FakeHistoricalBars((start) => [bars.find((bar) => bar.t === start)!]);
+    const partialStore = new MemoryAlpacaWorkerStore(); const partialBroker = new FakeBroker();
+    const partialWorker = worker(partialStore, partialBroker, undefined, true, partial, () => new Date(first.t + 2 * 60_000));
+    await partialWorker.start();
+    for (const bar of bars.filter((bar) => bar.t < first.t)) await partialWorker.processRawBar(bar);
+    const partialPostsBeforeGap = partialBroker.posts;
+    for (const bar of bars.filter((bar) => bar.t > second.t && bar.t <= second.t + 60_000)) await partialWorker.processRawBar(bar);
+    assert.equal(partialWorker.snapshot().recoveryState, "REBUILDING");
+    assert.equal(partialBroker.posts, partialPostsBeforeGap, "partial backfill is never dispatch authority");
+    assert.equal(partial.requests[0]!.end - partial.requests[0]!.start, 2 * 60_000);
+
+    const conflictStore = new MemoryAlpacaWorkerStore();
+    const conflictBroker = new FakeBroker();
+    const conflict = new FakeHistoricalBars((start, end) => bars.filter((bar) => bar.t >= start && bar.t < end));
+    const conflictWorker = worker(conflictStore, conflictBroker, undefined, true, conflict, () => new Date(first.t + 2 * 60_000));
+    await conflictWorker.start();
+    for (const bar of bars.filter((bar) => bar.t < first.t)) await conflictWorker.processRawBar(bar);
+    await conflictStore.insertClosedBar("SPY", { ...first, close: first.close + 9 });
+    const conflictPostsBeforeGap = conflictBroker.posts;
+    for (const bar of bars.filter((bar) => bar.t > first.t && bar.t <= first.t + 60_000)) await conflictWorker.processRawBar(bar);
+    assert.equal(conflictWorker.snapshot().recoveryState, "REBUILDING");
+    const conflictObservation = conflictStore.marketObservations().find((item) => item.origin === "REST_BACKFILL");
+    assert.equal(conflictObservation?.verificationResult, "CONFLICT");
+    assert.equal(conflictBroker.posts, conflictPostsBeforeGap);
+  });
+
+  it("keeps identical LIVE_WS and REST_BACKFILL observations idempotent", async () => {
+    const store = new MemoryAlpacaWorkerStore(); const bar = rawBars(1)[0]!;
+    assert.equal(await store.recordMarketBar({ symbol: "SPY", bar, providerEventTimestampMs: bar.t, observedAt: "2026-09-21T13:31:00.000Z", origin: "LIVE_WS", recoveryAttemptId: null }), "ACCEPTED");
+    assert.equal(await store.recordMarketBar({ symbol: "SPY", bar, providerEventTimestampMs: bar.t, observedAt: "2026-09-21T13:32:00.000Z", origin: "REST_BACKFILL", recoveryAttemptId: "attempt-1" }), "IDENTICAL");
+    assert.equal((await store.listClosedBars("SPY")).length, 1);
+    assert.equal(store.marketObservations().filter((item) => item.bar.t === bar.t).length, 2);
   });
 
   it("reconciles then reconnects one market consumer, cancels backoff on stop, and halts on reconciliation failure", async () => {

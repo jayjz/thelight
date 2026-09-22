@@ -5,10 +5,11 @@
 // this script never POSTs /v2/orders itself.
 const PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 const DATA_BASE_URL = "https://data.alpaca.markets";
+const { SPY_SPEC, alpacaEquityFeedFor } = await import("../src/lib/lightlight/assets.ts");
 const key = process.env.ALPACA_API_KEY_ID?.trim();
 const secret = process.env.ALPACA_API_SECRET_KEY?.trim();
-const symbol = process.env.ALPACA_SYMBOL?.trim().toUpperCase() || "SPY";
-const feed = (process.env.ALPACA_DATA_FEED?.trim() || "iex").toLowerCase();
+const symbol = process.env.ALPACA_SYMBOL?.trim().toUpperCase() || SPY_SPEC.symbol;
+const feed = (process.env.ALPACA_DATA_FEED?.trim() || alpacaEquityFeedFor(SPY_SPEC)).toLowerCase();
 const dispatch = process.argv.includes("--paper-dispatch");
 const observeOnly = process.argv.includes("--observe-only") || !dispatch;
 
@@ -85,7 +86,7 @@ async function dispatchThroughWorker(headers) {
     isRegularSession: (timestamp) => timestamp === targetTimestamp,
   });
   await worker.start();
-  const intent = (await store.listIntents()).find((row) => row.intent.createdAtTimestamp === targetTimestamp) ?? null;
+  const intent = (await store.listIntents(symbol)).find((row) => row.intent.createdAtTimestamp === targetTimestamp) ?? null;
   const brokerOrder = intent ? await store.latestBrokerOrder(intent.intent.intentId) : null;
   const snapshot = worker.snapshot();
   console.log(JSON.stringify({
@@ -105,7 +106,7 @@ async function dispatchThroughWorker(headers) {
 }
 
 if (!key || !secret) fail("Missing ALPACA_API_KEY_ID or ALPACA_API_SECRET_KEY.");
-else if (symbol !== "SPY") fail("The PAPER worker smoke supports SPY only.");
+else if (symbol !== SPY_SPEC.symbol) fail("The PAPER worker smoke supports the configured SPY asset only.");
 else if ((process.env.ALPACA_PAPER_BASE_URL?.trim() || PAPER_BASE_URL) !== PAPER_BASE_URL) fail("ALPACA_PAPER_BASE_URL must remain https://paper-api.alpaca.markets.");
 else if (!["iex", "sip", "delayed_sip"].includes(feed)) fail(`Unsupported Alpaca feed: ${feed}.`);
 else if (dispatch && process.env.ALPACA_PAPER_WORKER_SMOKE_DISPATCH !== "YES") fail("Refusing dispatch: ALPACA_PAPER_WORKER_SMOKE_DISPATCH must equal YES.");

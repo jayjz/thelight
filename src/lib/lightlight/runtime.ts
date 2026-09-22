@@ -10,7 +10,7 @@ export const getLightlightRuntimeStatus = createServerFn({ method: "GET" }).hand
 );
 
 const replayStatus: LightlightRuntimeStatus = {
-  mode: "PAPER_REPLAY", connectionState: "REPLAY", workerState: null, symbol: "SYN.LL1", feed: "synthetic-seeded", decisionTimeframe: "1D", latestRawBarTimestamp: null,
+  mode: "PAPER_REPLAY", connectionState: "REPLAY", workerState: null, symbol: "SYN.LL1", workerKey: null, runtimeCapability: null, feed: "synthetic-seeded", decisionTimeframe: "1D", latestRawBarTimestamp: null,
   latestClosedBarTimestamp: null, latestDecisionId: null, latestBrokerOrderState: null,
   currentPaperPosition: 0, openOrderSummary: { count: 0, clientOrderIds: [] }, riskState: null, lastTradeUpdateTimestamp: null,
   lastReconciliationTimestamp: null, streamState: "REPLAY", haltReason: null, jevAdapter: "mock-jev", jevModel: "mock-jev-not-typesafe", error: null,
