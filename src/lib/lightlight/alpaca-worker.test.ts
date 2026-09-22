@@ -177,6 +177,168 @@ async function runToDispatch(target: AlpacaPaperWorker, broker: FakeBroker) {
 }
 
 describe("Alpaca PAPER worker restart and authority invariants", () => {
+  it("persists STARTING, RECONCILING, and READY in order only after startup gates pass", async () => {
+    const store = new MemoryAlpacaWorkerStore();
+    const broker = new FakeBroker();
+    let releaseAccount!: () => void;
+    let enteredAccount!: () => void;
+    const accountEntered = new Promise<void>((resolve) => { enteredAccount = resolve; });
+    const accountGate = new Promise<void>((resolve) => { releaseAccount = resolve; });
+    const gatedBroker = Object.assign(Object.create(broker) as FakeBroker, {
+      async account() {
+        broker.accountCalls += 1;
+        enteredAccount();
+        await accountGate;
+        return { equity: broker.equity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_PAPER_ACCOUNT" as const };
+      },
+    });
+    const target = worker(store, gatedBroker);
+    const starting = target.start();
+    await accountEntered;
+    const inProgress = store.allRunEvidence()[0]!;
+    assert.equal(inProgress.state, "RECONCILING");
+    assert.deepEqual(store.runTransitions.map(({ state }) => state), ["STARTING", "RECONCILING"]);
+    releaseAccount();
+    await starting;
+    const run = store.allRunEvidence()[0]!;
+    assert.equal(run.state, "READY");
+    assert.deepEqual(store.runTransitions.map(({ state }) => state), ["STARTING", "RECONCILING", "READY"]);
+    assert.equal(broker.posts, 0, "persisting READY performs no broker order submission");
+    await target.stop();
+    assert.equal(store.runEvidence(run.runId)?.state, "STOPPED");
+    assert.ok(store.runEvidence(run.runId)?.stoppedAt);
+  });
+
+  it("persists HALTED on reconciliation failure and STOPPED when shutdown interrupts reconciliation", async () => {
+    const failedStore = new MemoryAlpacaWorkerStore();
+    const failedBroker = new FakeBroker(); failedBroker.throwAccount = true;
+    const failed = worker(failedStore, failedBroker);
+    await failed.start();
+    const haltedRun = failedStore.allRunEvidence()[0]!;
+    assert.equal(haltedRun.state, "HALTED");
+    assert.equal(haltedRun.haltReason, "ACCOUNT_UNAVAILABLE");
+    assert.ok(haltedRun.stoppedAt);
+
+    const store = new MemoryAlpacaWorkerStore();
+    const broker = new FakeBroker();
+    let releaseAccount!: () => void;
+    let enteredAccount!: () => void;
+    const accountEntered = new Promise<void>((resolve) => { enteredAccount = resolve; });
+    const accountGate = new Promise<void>((resolve) => { releaseAccount = resolve; });
+    const gatedBroker = Object.assign(Object.create(broker) as FakeBroker, {
+      async account() {
+        broker.accountCalls += 1;
+        enteredAccount();
+        await accountGate;
+        return { equity: broker.equity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_PAPER_ACCOUNT" as const };
+      },
+    });
+    const target = worker(store, gatedBroker);
+    const starting = target.start();
+    await accountEntered;
+    const runId = store.allRunEvidence()[0]!.runId;
+    assert.equal(store.runEvidence(runId)?.state, "RECONCILING");
+    await target.stop();
+    releaseAccount();
+    await starting;
+    const stopped = store.runEvidence(runId)!;
+    assert.equal(stopped.state, "STOPPED");
+    assert.ok(stopped.stoppedAt);
+    assert.equal(store.runTransitions.filter(({ state }) => state === "READY").length, 0);
+  });
+
+  it("fails closed when persisting a lifecycle transition fails", async () => {
+    const store = new MemoryAlpacaWorkerStore();
+    const persistRun = store.updateRun.bind(store);
+    let failReconciliationTransition = true;
+    store.updateRun = async (runId, state, haltReason) => {
+      if (state === "RECONCILING" && failReconciliationTransition) {
+        failReconciliationTransition = false;
+        throw new Error("RUN_STATE_WRITE_FAILED");
+      }
+      await persistRun(runId, state, haltReason);
+    };
+    const broker = new FakeBroker();
+    const updates = new FakeTradeUpdates();
+    const target = worker(store, broker, updates);
+    await target.start();
+    assert.equal(target.snapshot().workerState, "HALTED");
+    assert.equal(broker.accountCalls, 0, "failed RECONCILING persistence prevents broker reconciliation");
+    assert.equal(updates.connects, 0, "failed lifecycle persistence never opens trade updates");
+    assert.equal(broker.posts, 0);
+    assert.equal(store.allRunEvidence()[0]?.state, "HALTED");
+    assert.equal(store.allRunEvidence()[0]?.haltReason, "RUN_STATE_WRITE_FAILED");
+    assert.ok(store.allRunEvidence()[0]?.stoppedAt);
+  });
+
+  it("creates distinct run evidence on restart and prevents a superseded predecessor from regressing", async () => {
+    const store = new MemoryAlpacaWorkerStore();
+    const broker = new FakeBroker();
+    const first = worker(store, broker);
+    await first.start();
+    const firstRunId = store.allRunEvidence()[0]!.runId;
+    await first.stop();
+    const second = worker(store, broker);
+    await second.start();
+    const runs = store.allRunEvidence();
+    assert.equal(runs.length, 2);
+    assert.notEqual(runs[0]!.runId, runs[1]!.runId);
+    assert.equal(store.runEvidence(firstRunId)?.state, "STOPPED", "restart preserves terminal predecessor evidence");
+    await second.stop();
+
+    const takeover = new MemoryAlpacaWorkerStore();
+    const priorRun = "prior-run"; const successorRun = "successor-run"; const key = "test-worker";
+    await takeover.createRun(priorRun, key, "READY");
+    const priorLease = await takeover.acquireOwnership(key, priorRun, 30);
+    assert.ok(priorLease);
+    await takeover.releaseOwnership(priorLease);
+    await takeover.createRun(successorRun, key, "STARTING");
+    assert.ok(await takeover.acquireOwnership(key, successorRun, 30));
+    const superseded = takeover.runEvidence(priorRun)!;
+    assert.equal(superseded.state, "SUPERSEDED");
+    assert.equal(superseded.supersededByRunId, successorRun);
+    assert.ok(superseded.stoppedAt && superseded.supersededAt && superseded.supersedeReason);
+    await assert.rejects(() => takeover.updateRun(priorRun, "READY", null), /WORKER_RUN_LIFECYCLE_UPDATE_REJECTED/);
+    await assert.rejects(() => takeover.updateRun(priorRun, "RECONCILING", null), /WORKER_RUN_LIFECYCLE_UPDATE_REJECTED/);
+    await assert.rejects(() => takeover.updateRun(priorRun, "STOPPED", null), /WORKER_RUN_LIFECYCLE_UPDATE_REJECTED/);
+    assert.equal(takeover.runEvidence(priorRun)?.state, "SUPERSEDED");
+    assert.equal(takeover.runTransitions.filter(({ runId, state }) => runId === priorRun && state === "SUPERSEDED").length, 1);
+  });
+
+  it("stops a predecessor whose lease is taken over during asynchronous startup", async () => {
+    const store = new MemoryAlpacaWorkerStore();
+    const broker = new FakeBroker();
+    let releaseAccount!: () => void;
+    let enteredAccount!: () => void;
+    const accountEntered = new Promise<void>((resolve) => { enteredAccount = resolve; });
+    const accountGate = new Promise<void>((resolve) => { releaseAccount = resolve; });
+    const gatedBroker = Object.assign(Object.create(broker) as FakeBroker, {
+      async account() {
+        broker.accountCalls += 1;
+        enteredAccount();
+        await accountGate;
+        return { equity: broker.equity, reconciledAt: "2026-09-19T14:00:00.000Z", provenance: "ALPACA_PAPER_ACCOUNT" as const };
+      },
+    });
+    const updates = new FakeTradeUpdates();
+    const predecessor = worker(store, gatedBroker, updates);
+    const starting = predecessor.start();
+    await accountEntered;
+    const oldRun = store.allRunEvidence()[0]!;
+    const oldLease = store.leaseEvidence(oldRun.workerKey)!;
+    await store.releaseOwnership(oldLease);
+    const successorRun = "successor-after-startup-race";
+    await store.createRun(successorRun, oldRun.workerKey, "STARTING");
+    assert.ok(await store.acquireOwnership(oldRun.workerKey, successorRun, 30));
+    await predecessor.stop();
+    releaseAccount();
+    await starting;
+    assert.equal(store.runEvidence(oldRun.runId)?.state, "SUPERSEDED");
+    assert.equal(store.runEvidence(oldRun.runId)?.supersededByRunId, successorRun);
+    assert.equal(predecessor.snapshot().workerState, "STOPPED");
+    assert.equal(updates.connects, 0);
+  });
+
   it("applies stale-bar, reconciliation, and ownership gates to both SPY dispatch arms", () => {
     const healthy = {
       dispatchCapable: true,
