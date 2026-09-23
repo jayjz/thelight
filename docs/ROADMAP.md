@@ -251,7 +251,15 @@ Completed for BTC/USD:
 - B3: independent durable runtime identity, lease, checkpoint, and evidence namespace;
 - continuous BTC/USD observer/runtime via `btc:worker -- start` and `btc:observe`;
 - durable lifecycle, owned checkpoint, bounded reconnect and restart evidence;
-- explicit 24/7 operational freshness and visible gap uncertainty (no crypto backfill).
+- explicit 24/7 operational freshness;
+- bounded exact BTC historical recovery at startup and live gaps, complete pagination,
+  LIVE_WS/REST_BACKFILL provenance, fenced completion and VERIFIED continuity;
+- valid zero-volume bars and fail-closed incomplete/conflicting recovery, with
+  active/last recovery evidence in the observer.
+
+Recovery is limited to 24 hours; older history and provider revisions are not
+automatically certified or overwritten. See the historical contract and failure
+semantics in [BTC runtime](BTC_PAPER_RUNTIME.md#verified-historical-recovery).
 
 Run the [24h/72h observation soak](BTC_PAPER_RUNTIME.md#24h--72h-soak-procedure)
 before the next BTC milestone: PAPER execution. Stop with SIGINT/SIGTERM. BTC

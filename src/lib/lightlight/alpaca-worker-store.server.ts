@@ -57,6 +57,15 @@ export type GapRecoveryAttempt = {
   reason?: string | null;
 };
 
+/** Atomic, fenced market-only writes; no external calls while holding the lease lock. */
+export type OwnedMarketWrite = {
+  observations?: MarketBarObservation[];
+  attempt?: { value: GapRecoveryAttempt; create: boolean };
+  checkpoint?: WorkerCheckpoint;
+  /** Persist loss of trust atomically with a conflicting observation. */
+  checkpointOnConflict?: WorkerCheckpoint;
+};
+
 export type StoredIntent = {
   intent: ExecutionIntent;
   dispatchBlockReason: string | null;
@@ -95,6 +104,7 @@ export interface AlpacaWorkerStore {
   withDispatchAuthority<T>(lease: WorkerLease, intentId: string, scope: DurableWorkerScope, submit: () => Promise<T>): Promise<T | null>;
   insertClosedBar(symbol: string, bar: ClosedBar): Promise<boolean>;
   recordMarketBar(observation: MarketBarObservation): Promise<MarketBarWriteResult>;
+  writeMarketEvidenceOwned(lease: WorkerLease, write: OwnedMarketWrite): Promise<MarketBarWriteResult[] | null>;
   /** Reads the newest persisted raw bar without loading feature history. */
   latestClosedBarTimestamp(symbol: string): Promise<number | null>;
   /** Optional bounds keep restart recovery reads limited to feature history. */
@@ -264,6 +274,45 @@ export class SqlAlpacaWorkerStore implements AlpacaWorkerStore {
       );
       return result;
     });
+  }
+
+  async writeMarketEvidenceOwned(lease: WorkerLease, write: OwnedMarketWrite): Promise<MarketBarWriteResult[] | null> {
+    if (write.attempt && write.attempt.value.workerKey !== lease.workerKey) return null;
+    const sql = await this.sqlProvider();
+    const expired = new Error("MARKET_WRITE_LEASE_EXPIRED");
+    try {
+      return await sql.transaction(async tx => {
+        const held = await tx.query(
+          "select worker_key from worker_leases where worker_key = $1 and owner_run_id = $2 and fencing_token = $3 and lease_expires_at > clock_timestamp() for update",
+          [lease.workerKey, lease.runId, lease.fencingToken],
+        );
+        if (!held.length) return null;
+        // Reuse the immutable ledger implementation inside this transaction.
+        const scoped = Object.assign((() => { throw new Error("TAGGED_SQL_NOT_USED"); }) as unknown as Sql, {
+          query: tx.query.bind(tx), transaction: async <T>(callback: (sql: Sql) => Promise<T>) => callback(tx),
+        });
+        const store = new SqlAlpacaWorkerStore(async () => scoped);
+        const results: MarketBarWriteResult[] = [];
+        for (const observation of write.observations ?? []) results.push(await store.recordMarketBar(observation));
+        if (write.attempt) {
+          if (write.attempt.create) await store.createGapRecoveryAttempt(write.attempt.value);
+          else await store.updateGapRecoveryAttempt(write.attempt.value);
+        }
+        const checkpoint = results.includes("CONFLICT") ? write.checkpointOnConflict ?? write.checkpoint : write.checkpoint;
+        if (checkpoint) {
+          const durableCheckpoint = clone(checkpoint);
+          const backfilled = write.observations?.some(observation => observation.origin === "REST_BACKFILL") ?
+            results.filter(result => result === "ACCEPTED").length : 0;
+          if (backfilled && durableCheckpoint.marketEvidence) {
+            durableCheckpoint.marketEvidence.backfilledBarCount = (durableCheckpoint.marketEvidence.backfilledBarCount ?? 0) + backfilled;
+          }
+          await store.writeCheckpoint(lease.workerKey, durableCheckpoint);
+        }
+        const live = await tx.query("select worker_key from worker_leases where worker_key = $1 and lease_expires_at > clock_timestamp()", [lease.workerKey]);
+        if (!live.length) throw expired; // Roll back every write if the bounded transaction overran its lease.
+        return results;
+      });
+    } catch (error) { if (error === expired) return null; throw error; }
   }
 
   async latestClosedBarTimestamp(symbol: string): Promise<number | null> {
@@ -495,6 +544,25 @@ export class MemoryAlpacaWorkerStore implements AlpacaWorkerStore {
     const duplicate = this.observations.some((existing) => existing.symbol === observation.symbol && existing.bar.t === observation.bar.t && existing.origin === observation.origin && existing.recoveryAttemptId === observation.recoveryAttemptId);
     if (!duplicate) this.observations.push({ ...clone(observation), verificationResult: result });
     return result;
+  }
+  async writeMarketEvidenceOwned(lease: WorkerLease, write: OwnedMarketWrite): Promise<MarketBarWriteResult[] | null> {
+    const current = this.leases.get(lease.workerKey);
+    if (!current || current.runId !== lease.runId || current.fencingToken !== lease.fencingToken || Date.parse(current.leaseExpiresAt) <= Date.now() ||
+      (write.attempt && write.attempt.value.workerKey !== lease.workerKey)) return null;
+    const results: MarketBarWriteResult[] = [];
+    for (const observation of write.observations ?? []) results.push(await this.recordMarketBar(observation));
+    if (write.attempt) this.recoveryAttempts.set(write.attempt.value.recoveryAttemptId, clone(write.attempt.value));
+    const checkpoint = results.includes("CONFLICT") ? write.checkpointOnConflict ?? write.checkpoint : write.checkpoint;
+    if (checkpoint) {
+      const durableCheckpoint = clone(checkpoint);
+      const backfilled = write.observations?.some(observation => observation.origin === "REST_BACKFILL") ?
+        results.filter(result => result === "ACCEPTED").length : 0;
+      if (backfilled && durableCheckpoint.marketEvidence) {
+        durableCheckpoint.marketEvidence.backfilledBarCount = (durableCheckpoint.marketEvidence.backfilledBarCount ?? 0) + backfilled;
+      }
+      await this.writeCheckpoint(lease.workerKey, durableCheckpoint);
+    }
+    return results;
   }
   async latestClosedBarTimestamp(symbol: string): Promise<number | null> {
     const timestamps = [...this.bars.entries()]

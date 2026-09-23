@@ -63,15 +63,77 @@ invalidated on replacement. Auth, subscription and malformed/protocol failures
 are terminal. Completed-bar queues are bounded at 120; overflow halts rather than
 silently losing evidence. There is no process-level reconnect loop.
 
-Restart inspects the newest persisted BTC timestamp and at most the preceding
-24 hours of bars (1,440 one-minute timestamps). The recovered count is for that
-bounded window, not lifetime storage. A bar inserted before a crash but ahead of
-the checkpoint repairs the latest timestamp on restart. Bar identity remains
-`(symbol, timestamp_ms)`; identical duplicates are idempotent and conflicting
-OHLCV evidence halts. Old runs are preserved; an abandoned active predecessor is
-marked SUPERSEDED only by the existing database lease takeover semantics. A
-crashed owner must expire before replacement. Stale fencing cannot update the
-checkpoint. Historical rows are never reconstructed or deleted.
+### Verified historical recovery
+
+Historical data uses only `GET https://data.alpaca.markets/v1beta3/crypto/us/bars`
+with `symbols=BTC/USD`, `timeframe=1Min`, RFC3339 `start` and `end`, `sort=asc`,
+and `limit=10000`. Both provider bounds are **inclusive**. Every non-null
+`next_page_token` is followed, even on a short or apparently full page. Repeated
+tokens, missing tokens, malformed responses, unexpected symbols and conflicting
+duplicates fail closed. The client has no broker dependency or configurable host.
+See [Alpaca's endpoint contract](https://docs.alpaca.markets/us/reference/cryptobars-1).
+
+On startup, acquire ownership and read the latest durable BTC bar, bounded bar
+history and prior checkpoint. The verification scope ends at the last completed
+minute and begins no earlier than 1,439 minutes before it (24 hours inclusive).
+An existing verified prefix or first available durable bar can shorten this scope.
+Cold start or data older than the horizon uses the whole bounded window. Only
+missing or previously unverified contiguous ranges are fetched; an already
+complete verified interval requires no REST request. Bars inserted before a crash
+but beyond the verified checkpoint are checked against REST, not silently trusted.
+History older than the reported `verifiedStartMs` is not certified.
+
+For a live jump from 12:00 to 12:04, persist the recovery attempt/checkpoint in
+BACKFILLING with GAP_DETECTED continuity, request precisely 12:01 through 12:03,
+validate the entire response, persist recovered evidence, re-read and verify the
+durable range, and then accept 12:04 as LIVE_WS. Gaps exceeding 24 hours halt;
+a restart can establish a new explicitly bounded scope. There is no strategy or
+dispatch barrier in this market-only worker.
+
+Every expected minute timestamp must have exactly one matching valid bar. Positive
+finite OHLC, valid high/low bounds, aligned provider minute timestamps and finite
+nonnegative volume are mandatory. Identical duplicates collapse idempotently;
+conflicting evidence is never overwritten. Zero-volume bars are valid: Alpaca
+can use quote midpoint prices when no trade occurs, per its
+[historical crypto documentation](https://docs.alpaca.markets/us/docs/historical-crypto-data-1).
+REST parsing is separate from WebSocket b/u message parsing.
+
+No new ledger or migration is needed. `closed_bars` remains immutable canonical
+evidence; `market_bar_observations` records LIVE_WS versus REST_BACKFILL, provider
+timestamp and recovery-attempt ID. `market_gap_recovery_attempts` retains its
+existing **half-open** storage bounds: a one-minute request at 12:01 is stored as
+[12:01,12:02). This does not widen the provider request. The checkpoint's recovery
+summary includes the explicit inclusive `requestedStartMs`/`requestedEndMs`,
+requested/fetched/accepted/identical/conflicting counts, result/reason and times.
+Older attempt counts can be derived from its bounds and linked observations.
+
+BTC observation, recovery-attempt and checkpoint writes acquire the current
+lease row lock inside one transaction and validate run ID, fencing token and
+expiry. The transaction checks expiry again before completion and rolls back if
+expired. Cumulative accepted backfill counts advance in the same transaction as
+the corresponding immutable bar observations, so crash/restart retries do not
+lose or double-count them. GETs hold no database lock; ownership is renewed before and after each
+bounded fetch and before each batch of at most 32 recovered observations.
+Subscription startup timeout begins after historical recovery. Stale runs cannot
+insert recovered evidence, finish attempts or
+mark continuity healthy. Old runs are preserved and abandoned runs are superseded
+only through lease takeover.
+
+Historical reads have three attempts per page, deterministic 250/500ms backoff,
+a four-second request/body timeout and a 20-second whole-interval deadline.
+429/5xx and transport failures may retry; 401/403 and protocol failures are
+terminal. Retry-After and X-RateLimit-Reset are respected; a provider delay over
+five seconds fails rather than retrying early. Pagination is also bounded to
+1,441 pages. No outer worker retry loop repeats a failed recovery.
+
+Manual read-only smoke (not CI, no database mutation):
+
+```sh
+npm run btc:historical-smoke
+```
+
+It validates three completed minutes, leaving one extra minute of provider
+publication margin, and prints only their timestamps and count.
 
 ### Health and continuity
 
@@ -91,15 +153,24 @@ A delayed minute degrades health without halting or changing a strategy threshol
 Freshness, subscribed status and a live lease are separate evidence; a checkpoint
 heartbeat alone is not evidence of new bars. Database time drives observer ages.
 
-**No verified historical crypto backfill exists.** Continuity starts UNVERIFIED;
-a jump over missing minutes becomes sticky GAP_DETECTED and degrades health even
-after fresh bars resume. The service continues collecting later evidence, labels
-uncertainty and invents no missing bars. It cannot determine whether a missing
-minute represents absent provider activity or lost delivery. Updated bars (`u`)
-are excluded and old evidence is immutable. READY means current observation is
-healthy, not historically verified continuity. Storage failure halts; if the
-database itself is unavailable, durable failure recording may also fail, so the
-process logs `persistenceError` and exits nonzero and the lease expires.
+Continuity is UNVERIFIED until historical verification establishes a bounded
+scope, GAP_DETECTED during recovery or failure, and VERIFIED only after exact
+response and durable interval checks. Adjacent valid live bars extend that
+verified chronology. The observer reports continuity, verification bounds,
+active/last attempt, inclusive requested range, counts, result/reason and whether
+historical continuity is verified. UNVERIFIED and GAP_DETECTED degrade health.
+
+A failed, incomplete or conflicting recovery halts and preserves GAP_DETECTED;
+the arriving live bar is not accepted. Restart re-verifies the unresolved range; a prior live-bar conflict invalidates
+the trusted prefix and requires REST revalidation. Conflict invalidation is
+committed atomically with the observation result, including across a crash or
+ownership loss before the worker can persist its terminal halt.
+Storage failure also halts; if the database itself is unavailable, failure
+recording may fail, so `persistenceError` is logged and exit is nonzero. Updated
+bars (`u`) cannot revise immutable evidence. Provider revisions may therefore
+require investigation rather than automatic overwrite. Verification proves
+minute coverage within the reported scope, not independent price accuracy or
+completeness of older history. No 24h/72h soak or BTC execution is implied.
 
 ### 24h / 72h soak procedure
 

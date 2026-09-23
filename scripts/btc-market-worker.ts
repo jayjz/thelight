@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import type { Sql } from "../src/lib/db.ts";
 import { env } from "../src/lib/env.server.ts";
 import { AlpacaCryptoMarketSource, loadAlpacaCryptoCredentials } from "../src/lib/lightlight/alpaca-crypto.server.ts";
+import { AlpacaCryptoHistoricalBarsClient, type CryptoHistoricalBars } from "../src/lib/lightlight/alpaca-crypto-historical.server.ts";
 import { SqlAlpacaWorkerStore } from "../src/lib/lightlight/alpaca-worker-store.server.ts";
 import { DurableMarketWorker, type DurableMarketStore } from "../src/lib/lightlight/durable-market-worker.server.ts";
 import { BTC_USD_RUNTIME_IDENTITY, assertReadOnlyDurable } from "../src/lib/lightlight/runtime-identity.ts";
@@ -14,15 +15,15 @@ export function marketStoreOnly(store: SqlAlpacaWorkerStore): DurableMarketStore
     durable: store.durable,
     createRun: store.createRun.bind(store), updateRun: store.updateRun.bind(store),
     acquireOwnership: store.acquireOwnership.bind(store), renewOwnership: store.renewOwnership.bind(store),
-    releaseOwnership: store.releaseOwnership.bind(store), recordMarketBar: store.recordMarketBar.bind(store),
+    releaseOwnership: store.releaseOwnership.bind(store), writeMarketEvidenceOwned: store.writeMarketEvidenceOwned.bind(store),
     latestClosedBarTimestamp: store.latestClosedBarTimestamp.bind(store), listClosedBars: store.listClosedBars.bind(store),
-    readCheckpoint: store.readCheckpoint.bind(store), writeCheckpointOwned: store.writeCheckpointOwned.bind(store),
+    readCheckpoint: store.readCheckpoint.bind(store),
   };
 }
 
-export function createBtcMarketWorker(store: DurableMarketStore, source: AlpacaCryptoMarketSource): DurableMarketWorker {
+export function createBtcMarketWorker(store: DurableMarketStore, source: AlpacaCryptoMarketSource, historical?: CryptoHistoricalBars): DurableMarketWorker {
   assertReadOnlyDurable(BTC_USD_RUNTIME_IDENTITY);
-  return new DurableMarketWorker({ identity: BTC_USD_RUNTIME_IDENTITY, store, source });
+  return new DurableMarketWorker({ identity: BTC_USD_RUNTIME_IDENTITY, store, source, historical });
 }
 
 type Worker = Pick<DurableMarketWorker, "start" | "stop" | "snapshot">;
@@ -87,7 +88,7 @@ export async function main(): Promise<number> {
       catch (error) { await connected.query("ROLLBACK").catch(() => undefined); throw error; }
     };
     const store = marketStoreOnly(new SqlAlpacaWorkerStore(async () => sql));
-    return await runBtcWorker(createBtcMarketWorker(store, new AlpacaCryptoMarketSource(credentials)));
+    return await runBtcWorker(createBtcMarketWorker(store, new AlpacaCryptoMarketSource(credentials), new AlpacaCryptoHistoricalBarsClient(credentials)));
   } catch {
     console.error("BTC_STARTUP_FAILED: check database availability/migrations and Alpaca market-data credentials.");
     return 1;
