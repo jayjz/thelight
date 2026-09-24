@@ -3,8 +3,20 @@ import type { AlpacaCryptoCredentials } from "./alpaca-crypto.server.ts";
 
 export const ALPACA_CRYPTO_BARS_URL = "https://data.alpaca.markets/v1beta3/crypto/us/bars";
 export const BTC_RECOVERY_WINDOW_MS = 24 * 60 * 60_000;
+export const MIN_BOOTSTRAP_VERIFIED_MINUTES = 60;
 export type HistoricalInterval = { symbol: "BTC/USD"; startMs: number; endMs: number };
 export type CryptoHistoricalBars = { fetchCompletedBars(interval: HistoricalInterval): Promise<ClosedBar[]> };
+export type HistoricalMissingRange = { startMs: number; endMs: number };
+export type BootstrapCoverage = {
+  requestedBarCount: number;
+  returnedBarCount: number;
+  missingMinuteCount: number;
+  missingRanges: HistoricalMissingRange[];
+  verifiedStartMs: number | null;
+  verifiedThroughMs: number | null;
+  verifiedContiguousMinuteCount: number;
+  qualifies: boolean;
+};
 export type HistoricalFailure = "AUTHENTICATION_FAILURE" | "TIMEOUT" | "HTTP_FAILURE" | "PROTOCOL_FAILURE" | "INCOMPLETE_RECOVERY" | "CONFLICT";
 export class CryptoHistoricalError extends Error {
   readonly code: HistoricalFailure;
@@ -28,6 +40,37 @@ export function verifyExactBars(bars: ClosedBar[], interval: HistoricalInterval)
     if ([b.open, b.high, b.low, b.close, b.volume].some(v => !Number.isFinite(v)) ||
       Math.min(b.open, b.high, b.low, b.close) <= 0 || b.volume < 0 || b.high < Math.max(b.open, b.close) || b.low > Math.min(b.open, b.close)) fail("PROTOCOL_FAILURE");
   }
+}
+export function validateHistoricalBars(bars: ClosedBar[], interval: HistoricalInterval): void {
+  let previous = interval.startMs - 60_000;
+  for (const bar of bars) {
+    if (bar.t <= previous) fail("PROTOCOL_FAILURE");
+    verifyExactBars([bar], { ...interval, startMs: bar.t, endMs: bar.t });
+    previous = bar.t;
+  }
+}
+export function analyzeBootstrapCoverage(bars: ClosedBar[], interval: HistoricalInterval): BootstrapCoverage {
+  validateHistoricalBars(bars, interval);
+  const present = new Set(bars.map((bar) => bar.t));
+  const missingRanges: HistoricalMissingRange[] = [];
+  for (let timestamp = interval.startMs; timestamp <= interval.endMs; timestamp += 60_000) {
+    if (present.has(timestamp)) continue;
+    const prior = missingRanges.at(-1);
+    if (prior && prior.endMs + 60_000 === timestamp) prior.endMs = timestamp;
+    else missingRanges.push({ startMs: timestamp, endMs: timestamp });
+  }
+  let verifiedContiguousMinuteCount = 0;
+  const newestReturnedMs = bars.at(-1)?.t ?? null;
+  for (let timestamp = newestReturnedMs; timestamp !== null && present.has(timestamp); timestamp -= 60_000) verifiedContiguousMinuteCount += 1;
+  const verifiedThroughMs = verifiedContiguousMinuteCount ? newestReturnedMs : null;
+  const verifiedStartMs = verifiedThroughMs === null ? null : verifiedThroughMs - (verifiedContiguousMinuteCount - 1) * 60_000;
+  return {
+    requestedBarCount: (interval.endMs - interval.startMs) / 60_000 + 1,
+    returnedBarCount: bars.length,
+    missingMinuteCount: missingRanges.reduce((count, range) => count + (range.endMs - range.startMs) / 60_000 + 1, 0),
+    missingRanges, verifiedStartMs, verifiedThroughMs, verifiedContiguousMinuteCount,
+    qualifies: verifiedContiguousMinuteCount >= MIN_BOOTSTRAP_VERIFIED_MINUTES,
+  };
 }
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return fail("PROTOCOL_FAILURE");
@@ -94,7 +137,7 @@ export class AlpacaCryptoHistoricalBarsClient implements CryptoHistoricalBars {
         const next = data.next_page_token;
         if (next === null) {
           const result = [...bars.values()].sort((a, b) => a.t - b.t);
-          verifyExactBars(result, interval);
+          validateHistoricalBars(result, interval);
           return result;
         }
         if (typeof next !== "string" || !next || tokens.has(next)) return fail("PROTOCOL_FAILURE");

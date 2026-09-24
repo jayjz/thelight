@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { DurableMarketWorker } from "./durable-market-worker.server.ts";
 import { MemoryAlpacaWorkerStore, type WorkerCheckpoint } from "./alpaca-worker-store.server.ts";
 import { BTC_USD_RUNTIME_IDENTITY, assertReadOnlyDurable } from "./runtime-identity.ts";
-import { CryptoHistoricalError, type HistoricalInterval } from "./alpaca-crypto-historical.server.ts";
+import { CryptoHistoricalError, MIN_BOOTSTRAP_VERIFIED_MINUTES, type HistoricalInterval } from "./alpaca-crypto-historical.server.ts";
 import { loadBtcObserverSnapshot } from "./btc-observe.ts";
 
 const identity = BTC_USD_RUNTIME_IDENTITY; assertReadOnlyDurable(identity);
@@ -64,6 +64,7 @@ describe("verified BTC recovery", () => {
       const cp = (await s.checkpoint())!;
       assert.equal(cp.marketEvidence?.continuity, "GAP_DETECTED"); assert.equal(s.worker.snapshot().state, "HALTED");
       assert.equal(cp.marketEvidence?.recovery?.reason, "INCOMPLETE_RECOVERY");
+      assert.equal(cp.marketEvidence?.recovery?.recoveryKind, "EXACT_LIVE_GAP_REPAIR");
       assert.equal(await s.store.latestClosedBarTimestamp("BTC/USD"), t);
       const seen = await observer(cp, s.worker.snapshot().runId!);
       assert.equal(seen.historicalContinuityVerified, false); assert.equal(seen.recovery?.reason, "INCOMPLETE_RECOVERY");
@@ -77,7 +78,7 @@ describe("verified BTC recovery", () => {
       assert.equal(s.worker.snapshot().haltReason, "HISTORICAL_RECOVERY_CONFLICT");
       assert.equal(cp.marketEvidence?.continuity, "GAP_DETECTED");
       assert.equal(cp.marketEvidence?.recovery?.conflictingBarCount, 1);
-      assert.equal((await s.store.listClosedBars("BTC/USD"))[0]?.close, 100);
+      assert.equal((await s.store.listClosedBars("BTC/USD")).find(candidate => candidate.t === t)?.close, 100);
     } finally { await s.worker.stop(); }
   });
   it("restart uses durable bars past a stale checkpoint and fetches exactly the unverified suffix", async () => {
@@ -109,6 +110,78 @@ describe("verified BTC recovery", () => {
       assert.deepEqual(s.requests, [{ symbol: "BTC/USD", startMs: t - 1439 * 60_000, endMs: t }]);
       assert.equal((await s.store.listClosedBars("BTC/USD")).length, 1440);
     } finally { await s.worker.stop(); }
+  });
+  it("qualifies a sparse cold start without inventing provider-absent minutes", async () => {
+    const s = setup();
+    const missing = [1200, 1080, 970, 845, 660, 430, 300].map(offset => t - offset * 60_000);
+    s.historical.fetchCompletedBars = async range => sequence(range).filter(candidate => !missing.includes(candidate.t));
+    try {
+      await s.worker.start();
+      const checkpoint = (await s.checkpoint())!;
+      const bootstrap = checkpoint.marketEvidence?.bootstrap;
+      assert.ok(bootstrap);
+      assert.equal(s.worker.snapshot().state, "READY");
+      assert.equal(checkpoint.marketEvidence?.continuity, "VERIFIED");
+      assert.equal(bootstrap.requestedBarCount, 1440); assert.equal(bootstrap.returnedBarCount, 1433);
+      assert.equal(bootstrap.missingMinuteCount, 7); assert.equal(bootstrap.missingRanges.length, 7);
+      assert.equal(bootstrap.verifiedContiguousMinuteCount, 300); assert.equal(bootstrap.verifiedStartMs, t - 299 * 60_000); assert.equal(bootstrap.verifiedThroughMs, t);
+      assert.equal(checkpoint.marketEvidence?.recovery?.recoveryKind, "BOOTSTRAP_QUALIFICATION");
+      const seen = await observer(checkpoint, s.worker.snapshot().runId!);
+      assert.equal(seen.bootstrap?.missingMinuteCount, 7); assert.equal(seen.recovery?.recoveryKind, "BOOTSTRAP_QUALIFICATION");
+      const persisted = await s.store.listClosedBars("BTC/USD");
+      assert.equal(persisted.length, 1433); assert.ok(missing.every(timestamp => !persisted.some(candidate => candidate.t === timestamp)));
+      assert.equal(s.store.marketObservations().filter(observation => observation.origin === "REST_BACKFILL").length, 1433);
+    } finally { await s.worker.stop(); }
+  });
+  it("qualifies a 60-bar cold bootstrap ending before the requested end without persisting a synthetic bar", async () => {
+    const s = setup();
+    s.historical.fetchCompletedBars = async range => sequence(range).filter(candidate => candidate.t >= range.endMs - 60 * 60_000 && candidate.t < range.endMs);
+    try {
+      await s.worker.start();
+      const checkpoint = (await s.checkpoint())!;
+      const bootstrap = checkpoint.marketEvidence?.bootstrap;
+      assert.ok(bootstrap);
+      assert.equal(s.worker.snapshot().state, "READY");
+      assert.equal(checkpoint.marketEvidence?.continuity, "VERIFIED");
+      assert.equal(bootstrap.verifiedContiguousMinuteCount, 60);
+      assert.equal(bootstrap.verifiedThroughMs, t - 60_000);
+      assert.equal(bootstrap.verifiedStartMs, t - 60 * 60_000);
+      assert.equal(bootstrap.missingMinuteCount, 1380);
+      assert.ok(bootstrap.missingRanges.some(range => range.startMs === t && range.endMs === t));
+      const persisted = await s.store.listClosedBars("BTC/USD");
+      assert.equal(persisted.length, 60);
+      assert.equal(persisted.some(candidate => candidate.t === t), false);
+    } finally { await s.worker.stop(); }
+  });
+  for (const minuteCount of [MIN_BOOTSTRAP_VERIFIED_MINUTES, MIN_BOOTSTRAP_VERIFIED_MINUTES - 1]) it(`cold bootstrap ${minuteCount} contiguous minutes ${minuteCount === MIN_BOOTSTRAP_VERIFIED_MINUTES ? "qualifies" : "fails closed"}`, async () => {
+    const s = setup();
+    s.historical.fetchCompletedBars = async range => sequence(range).filter(candidate => candidate.t >= range.endMs - (minuteCount - 1) * 60_000);
+    try {
+      await s.worker.start();
+      const checkpoint = (await s.checkpoint())!;
+      assert.equal(checkpoint.marketEvidence?.bootstrap?.verifiedContiguousMinuteCount, minuteCount);
+      assert.equal(checkpoint.marketEvidence?.bootstrap?.result, minuteCount === MIN_BOOTSTRAP_VERIFIED_MINUTES ? "QUALIFIED" : "FAILED");
+      if (minuteCount === MIN_BOOTSTRAP_VERIFIED_MINUTES) {
+        assert.equal(s.worker.snapshot().state, "READY"); assert.equal(checkpoint.marketEvidence?.continuity, "VERIFIED");
+      } else {
+        assert.equal(s.worker.snapshot().state, "HALTED"); assert.equal(checkpoint.marketEvidence?.continuity, "GAP_DETECTED");
+        assert.equal(s.worker.snapshot().haltReason, "HISTORICAL_BOOTSTRAP_INSUFFICIENT_CONTIGUOUS_SUFFIX");
+      }
+    } finally { await s.worker.stop(); }
+  });
+  it("restart preserves the bounded bootstrap suffix without certifying older sparse minutes", async () => {
+    const a = setup(); const missing = t - 120 * 60_000;
+    a.historical.fetchCompletedBars = async range => sequence(range).filter(candidate => candidate.t !== missing);
+    try { await a.worker.start(); assert.equal((await a.checkpoint())?.marketEvidence?.verifiedStartMs, t - 119 * 60_000); }
+    finally { await a.worker.stop(); }
+    const b = setup(a.store, t + 120_000);
+    try {
+      await b.worker.start();
+      const checkpoint = (await b.checkpoint())!;
+      assert.equal(checkpoint.marketEvidence?.verifiedStartMs, t - 119 * 60_000);
+      assert.equal(checkpoint.marketEvidence?.verifiedThroughMs, t + 60_000);
+      assert.equal((await b.store.listClosedBars("BTC/USD")).some(candidate => candidate.t === missing), false);
+    } finally { await b.worker.stop(); }
   });
   it("stale token cannot write observations, complete an attempt, or advance checkpoint after GET", async () => {
     const s = setup(); await s.store.insertClosedBar("BTC/USD", bar());
@@ -144,14 +217,14 @@ describe("verified BTC recovery", () => {
     await s.worker.stop(); await s.store.releaseOwnership(s.store.leaseEvidence(identity.workerKey)!);
     s.store.writeMarketEvidenceOwned = original;
     const b = setup(s.store);
-    try { await b.worker.start(); assert.equal((await b.checkpoint())?.marketEvidence?.recovery?.identicalBarCount, 1); assert.equal((await b.checkpoint())?.marketEvidence?.backfilledBarCount, 1); assert.equal((await b.checkpoint())?.marketEvidence?.continuity, "VERIFIED"); }
+    try { await b.worker.start(); assert.equal((await b.checkpoint())?.marketEvidence?.recovery?.identicalBarCount, 33); assert.equal((await b.store.listClosedBars("BTC/USD")).length, 1440); assert.equal((await b.checkpoint())?.marketEvidence?.continuity, "VERIFIED"); }
     finally { await b.worker.stop(); }
   });
   it("restart re-verifies the trusted prefix after a conflicting live observation", async () => {
     const a = setup(); await a.store.insertClosedBar("BTC/USD", bar());
     await a.worker.start(); await a.worker.processClosedBar({ ...bar(), close: 100 }); await a.worker.stop();
     const b = setup(a.store);
-    try { await b.worker.start(); assert.deepEqual(b.requests, [{ symbol: "BTC/USD", startMs: t, endMs: t }]); assert.equal((await b.checkpoint())?.marketEvidence?.continuity, "VERIFIED"); }
+    try { await b.worker.start(); assert.deepEqual(b.requests, [{ symbol: "BTC/USD", startMs: t - 1439 * 60_000, endMs: t }]); assert.equal((await b.checkpoint())?.marketEvidence?.continuity, "VERIFIED"); }
     finally { await b.worker.stop(); }
   });
   it("conflict and lost ownership atomically invalidate trust before the halt checkpoint", async () => {

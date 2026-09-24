@@ -4,7 +4,7 @@ import type { ClosedBar } from "./types.ts";
 import type { AlpacaWorkerStore, WorkerCheckpoint, WorkerLease, GapRecoveryAttempt, OwnedMarketWrite } from "./alpaca-worker-store.server.ts";
 import { assertReadOnlyDurable, type ReadOnlyDurableCapability, type WorkerRuntimeIdentity } from "./runtime-identity.ts";
 
-import { BTC_RECOVERY_WINDOW_MS, CryptoHistoricalError, sameClosedBar, verifyExactBars, type CryptoHistoricalBars, type HistoricalInterval } from "./alpaca-crypto-historical.server.ts";
+import { BTC_RECOVERY_WINDOW_MS, CryptoHistoricalError, analyzeBootstrapCoverage, sameClosedBar, verifyExactBars, type BootstrapCoverage, type CryptoHistoricalBars, type HistoricalInterval, type HistoricalMissingRange } from "./alpaca-crypto-historical.server.ts";
 
 export const MARKET_WORKER_LEASE_SECONDS = 30;
 export const MARKET_WORKER_RENEW_MS = 10_000;
@@ -24,6 +24,7 @@ export type MarketStreamEvidence = {
   lastError: string | null;
 };
 export type BtcRecoveryEvidence = GapRecoveryAttempt & {
+  recoveryKind: "BOOTSTRAP_QUALIFICATION" | "EXACT_LIVE_GAP_REPAIR";
   /** Provider request bounds are inclusive; the shared attempt ledger uses an exclusive end. */
   requestedStartMs: number;
   requestedEndMs: number;
@@ -31,6 +32,15 @@ export type BtcRecoveryEvidence = GapRecoveryAttempt & {
   acceptedBarCount: number;
   identicalBarCount: number;
   conflictingBarCount: number;
+  historicalMissingMinuteCount?: number;
+  historicalMissingRanges?: HistoricalMissingRange[];
+  verifiedContiguousMinuteCount?: number;
+};
+export type BtcBootstrapEvidence = BootstrapCoverage & {
+  recoveryAttemptId: string;
+  result: "QUALIFIED" | "FAILED";
+  reason: string | null;
+  completedAt: string;
 };
 export type DurableMarketEvidence = {
   runId: string;
@@ -40,6 +50,7 @@ export type DurableMarketEvidence = {
   continuity: "UNVERIFIED" | "GAP_DETECTED" | "VERIFIED";
   verifiedStartMs?: number | null;
   verifiedThroughMs?: number | null;
+  bootstrap?: BtcBootstrapEvidence | null;
   recovery?: BtcRecoveryEvidence | null;
   backfilledBarCount?: number;
   lastBarPersistedAt: string | null;
@@ -137,17 +148,20 @@ export class DurableMarketWorker {
         lastBarPersistedAt: prior?.marketEvidence?.lastBarPersistedAt ?? null,
         verifiedStartMs: prior?.marketEvidence?.verifiedStartMs ?? null,
         verifiedThroughMs: prior?.marketEvidence?.verifiedThroughMs ?? null,
+        bootstrap: prior?.marketEvidence?.bootstrap ?? null,
         recovery: prior?.marketEvidence?.recovery ?? null,
         backfilledBarCount: prior?.marketEvidence?.backfilledBarCount ?? 0,
       };
       // A prior conflict invalidates the trusted prefix until REST has checked it again.
-      if (prior?.haltReason === "MARKET_BAR_CONFLICT" || prior?.marketEvidence?.recovery?.reason === "CONFLICT") {
+      const priorConflict = prior?.haltReason === "MARKET_BAR_CONFLICT" || prior?.marketEvidence?.recovery?.reason === "CONFLICT";
+      if (priorConflict) {
         this.evidence.verifiedStartMs = null;
         this.evidence.verifiedThroughMs = null;
         this.evidence.continuity = "GAP_DETECTED";
       }
       // Recovery must inspect gaps too, including a bar committed before its
       // checkpoint write. Merely taking max(timestamp) would erase that warning.
+      const hasVerifiedBounds = this.evidence.verifiedStartMs != null && this.evidence.verifiedThroughMs != null;
       for (let index = 1; index < bars.length; index += 1) {
         const previous = bars[index - 1]!.t;
         const current = bars[index]!.t;
@@ -156,10 +170,15 @@ export class DurableMarketWorker {
       if (this.options.historical) {
         const end = Math.floor(this.now() / 60_000) * 60_000 - 60_000;
         const floor = end - RECOVERY_WINDOW_MS + 60_000;
-        const start = Math.max(floor, this.evidence.verifiedStartMs ?? bars[0]?.t ?? floor);
         // Durable bars, not a possibly stale checkpoint, define chronology.
         this.checkpoint.latestRawBarTimestamp = latest;
-        if (!await this.recoverContinuity(start, end)) return;
+        const requiresExactRecovery = priorConflict || hasVerifiedBounds || this.evidence.recovery?.recoveryKind === "EXACT_LIVE_GAP_REPAIR";
+        if (!requiresExactRecovery) {
+          if (!await this.qualifyBootstrap({ symbol: "BTC/USD", startMs: floor, endMs: end })) return;
+        } else {
+          const start = Math.max(floor, this.evidence.verifiedStartMs ?? bars[0]?.t ?? floor);
+          if (!await this.recoverExactContinuity(start, end)) return;
+        }
       }
       this.startedAt = this.now(); // Subscription timeout starts after bounded historical recovery.
       await this.syncStream();
@@ -207,7 +226,7 @@ export class DurableMarketWorker {
         this.markGap(previous, bar.t);
         await this.persistCheckpoint();
         if (!this.active()) return;
-        if (this.options.historical && !await this.recoverContinuity(previous + 60_000, bar.t - 60_000)) return;
+        if (this.options.historical && !await this.recoverExactContinuity(previous + 60_000, bar.t - 60_000)) return;
       }
       // A crash/takeover after a conflicting insert must not leave a trusted prefix.
       // Commit this degraded checkpoint in the same fenced transaction as the result.
@@ -234,8 +253,87 @@ export class DurableMarketWorker {
       await this.persistCheckpoint();
     });
   }
-  /** Verifies only this bounded scope; older history is never implicitly certified. */
-  private async recoverContinuity(startMs: number, endMs: number): Promise<boolean> {
+  private async qualifyBootstrap(interval: HistoricalInterval): Promise<boolean> {
+    const evidence = this.evidence!;
+    const historical = this.options.historical!;
+    const attempt: BtcRecoveryEvidence = {
+      recoveryAttemptId: randomUUID(), workerKey: this.options.identity.workerKey, symbol: interval.symbol,
+      recoveryKind: "BOOTSTRAP_QUALIFICATION", missingStartMs: interval.startMs, missingEndMs: interval.endMs + 60_000,
+      requestedStartMs: interval.startMs, requestedEndMs: interval.endMs, state: "BACKFILLING",
+      detectedAt: new Date(this.now()).toISOString(), requestedAt: new Date(this.now()).toISOString(),
+      requestedBarCount: (interval.endMs - interval.startMs) / 60_000 + 1,
+      returnedBarCount: 0, verifiedBarCount: 0, acceptedBarCount: 0, identicalBarCount: 0, conflictingBarCount: 0,
+    };
+    evidence.continuity = "GAP_DETECTED";
+    evidence.recovery = attempt;
+    this.checkpoint.recoveryState = "BACKFILLING";
+    this.checkpoint.recoveryAttemptId = attempt.recoveryAttemptId;
+    this.checkpoint.recoveryMissingStartMs = null;
+    this.checkpoint.recoveryMissingEndMs = null;
+    this.checkpoint.recoveryCompletedAt = null;
+    this.captureStream();
+    if (!await this.ownedWrite({ attempt: { value: attempt, create: true }, checkpoint: this.checkpoint })) return false;
+    try {
+      const bars = await historical.fetchCompletedBars(interval);
+      attempt.returnedBarCount = bars.length;
+      const coverage = analyzeBootstrapCoverage(bars, interval);
+      attempt.historicalMissingMinuteCount = coverage.missingMinuteCount;
+      attempt.historicalMissingRanges = coverage.missingRanges;
+      attempt.verifiedContiguousMinuteCount = coverage.verifiedContiguousMinuteCount;
+      if (!await this.renewForRecovery()) return false;
+      attempt.state = "VERIFYING";
+      this.checkpoint.recoveryState = "VERIFYING";
+      for (let offset = 0; offset < bars.length; offset += 32) {
+        if (!await this.renewForRecovery()) return false;
+        const results = await this.ownedWrite({
+          observations: bars.slice(offset, offset + 32).map(bar => ({ symbol: interval.symbol, bar, providerEventTimestampMs: bar.t, observedAt: new Date(this.now()).toISOString(), origin: "REST_BACKFILL", recoveryAttemptId: attempt.recoveryAttemptId })),
+          attempt: { value: attempt, create: false }, checkpoint: this.checkpoint,
+        });
+        if (!results) return false;
+        attempt.acceptedBarCount += results.filter(result => result === "ACCEPTED").length;
+        attempt.identicalBarCount += results.filter(result => result === "IDENTICAL").length;
+        attempt.conflictingBarCount += results.filter(result => result === "CONFLICT").length;
+        evidence.backfilledBarCount = (evidence.backfilledBarCount ?? 0) + results.filter(result => result === "ACCEPTED").length;
+        if (attempt.conflictingBarCount) throw new CryptoHistoricalError("CONFLICT");
+      }
+      const stored = new Map((await this.options.store.listClosedBars(interval.symbol, interval.startMs, interval.endMs)).map(bar => [bar.t, bar]));
+      if (bars.some(bar => !stored.has(bar.t) || !sameClosedBar(stored.get(bar.t)!, bar))) throw new CryptoHistoricalError("CONFLICT");
+      attempt.verifiedBarCount = coverage.verifiedContiguousMinuteCount;
+      attempt.verifiedAt = new Date(this.now()).toISOString();
+      attempt.completedAt = attempt.verifiedAt;
+      evidence.bootstrap = { ...coverage, recoveryAttemptId: attempt.recoveryAttemptId, result: coverage.qualifies ? "QUALIFIED" : "FAILED", reason: coverage.qualifies ? null : "INSUFFICIENT_BOOTSTRAP_SUFFIX", completedAt: attempt.completedAt };
+      if (!coverage.qualifies) {
+        attempt.state = "GAP_DETECTED"; attempt.result = "FAILED"; attempt.reason = "INSUFFICIENT_BOOTSTRAP_SUFFIX";
+        this.checkpoint.recoveryState = "GAP_DETECTED";
+        if (!await this.ownedWrite({ attempt: { value: attempt, create: false }, checkpoint: this.checkpoint })) return false;
+        await this.halt("HISTORICAL_BOOTSTRAP_INSUFFICIENT_CONTIGUOUS_SUFFIX");
+        return false;
+      }
+      attempt.state = "HEALTHY"; attempt.result = "QUALIFIED"; attempt.reason = null;
+      evidence.continuity = "VERIFIED";
+      evidence.verifiedStartMs = coverage.verifiedStartMs;
+      evidence.verifiedThroughMs = coverage.verifiedThroughMs;
+      this.checkpoint.latestRawBarTimestamp = Math.max(this.checkpoint.latestRawBarTimestamp ?? 0, coverage.verifiedThroughMs!);
+      this.checkpoint.recoveryState = "HEALTHY";
+      this.checkpoint.recoveryCompletedAt = attempt.completedAt;
+      this.captureStream();
+      if (!await this.ownedWrite({ attempt: { value: attempt, create: false }, checkpoint: this.checkpoint })) {
+        evidence.continuity = "GAP_DETECTED";
+        return false;
+      }
+      return true;
+    } catch (error) {
+      if (!(error instanceof CryptoHistoricalError)) throw error;
+      attempt.returnedBarCount = Math.max(attempt.returnedBarCount ?? 0, error.fetchedBarCount);
+      attempt.state = "GAP_DETECTED"; attempt.result = "FAILED"; attempt.reason = error.code;
+      attempt.completedAt = new Date(this.now()).toISOString();
+      this.checkpoint.recoveryState = "GAP_DETECTED";
+      if (!await this.ownedWrite({ attempt: { value: attempt, create: false }, checkpoint: this.checkpoint })) return false;
+      await this.halt(`HISTORICAL_RECOVERY_${error.code}`);
+      return false;
+    }
+  }
+  private async recoverExactContinuity(startMs: number, endMs: number): Promise<boolean> {
     const evidence = this.evidence!;
     const historical = this.options.historical!;
     const symbol = this.options.identity.asset.symbol;
@@ -259,6 +357,7 @@ export class DurableMarketWorker {
       if (!await this.renewForRecovery()) return false;
       const attempt: BtcRecoveryEvidence = {
         recoveryAttemptId: randomUUID(), workerKey: this.options.identity.workerKey, symbol,
+        recoveryKind: "EXACT_LIVE_GAP_REPAIR",
         missingStartMs: range.startMs, missingEndMs: range.endMs + 60_000, requestedStartMs: range.startMs, requestedEndMs: range.endMs, state: "BACKFILLING",
         detectedAt: new Date(this.now()).toISOString(), requestedAt: new Date(this.now()).toISOString(),
         requestedBarCount: (range.endMs - range.startMs) / 60_000 + 1,
@@ -323,8 +422,7 @@ export class DurableMarketWorker {
     }
     if (!await this.renewForRecovery()) return false;
     evidence.continuity = "VERIFIED";
-    // Keep a contiguous prior prefix on live repair; startup clips to the horizon.
-    evidence.verifiedStartMs = this.state === "STARTING" ? startMs : Math.min(evidence.verifiedStartMs ?? startMs, startMs);
+    evidence.verifiedStartMs ??= startMs;
     evidence.verifiedThroughMs = endMs;
     this.checkpoint.latestRawBarTimestamp = Math.max(this.checkpoint.latestRawBarTimestamp ?? 0, endMs);
     this.checkpoint.recoveryState = "HEALTHY";
