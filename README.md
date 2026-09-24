@@ -139,3 +139,13 @@ See [docs/ALPACA_PAPER_WORKER.md](docs/ALPACA_PAPER_WORKER.md) for authority, re
 - [Relay capability](docs/lightlight-relay-capability.md) — bounded single-upstream equity subscription contract.
 - [Execution model](docs/EXECUTION_MODEL.md) — causal fills, accounting, and unknown execution state.
 - [Roadmap](docs/ROADMAP.md) — current milestones and sequencing.
+
+## SPY strategy research (read-only)
+
+`npm run research:paper-session -- --strategy ema_rsi_v1 --symbol SPY --date 2026-09-23`
+exports and analyzes existing durable evidence using DATABASE_URL only. Offline
+fixtures require no database or broker access. `ema_rsi_v2` is a frozen research
+candidate, not a registered PAPER worker arm; V1 and execution authority are unchanged.
+See [reproduction and evidence limits](docs/experiments/PAPER_SESSION_RESEARCH.md),
+[prospective specification](docs/experiments/EMA_RSI_V2.md), and
+[development results](docs/experiments/SPY_DEVELOPMENT_RESULTS.md).
