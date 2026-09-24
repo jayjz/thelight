@@ -60,8 +60,9 @@ export function analyzeBootstrapCoverage(bars: ClosedBar[], interval: Historical
     else missingRanges.push({ startMs: timestamp, endMs: timestamp });
   }
   let verifiedContiguousMinuteCount = 0;
-  for (let timestamp = interval.endMs; present.has(timestamp); timestamp -= 60_000) verifiedContiguousMinuteCount += 1;
-  const verifiedThroughMs = verifiedContiguousMinuteCount ? interval.endMs : null;
+  const newestReturnedMs = bars.at(-1)?.t ?? null;
+  for (let timestamp = newestReturnedMs; timestamp !== null && present.has(timestamp); timestamp -= 60_000) verifiedContiguousMinuteCount += 1;
+  const verifiedThroughMs = verifiedContiguousMinuteCount ? newestReturnedMs : null;
   const verifiedStartMs = verifiedThroughMs === null ? null : verifiedThroughMs - (verifiedContiguousMinuteCount - 1) * 60_000;
   return {
     requestedBarCount: (interval.endMs - interval.startMs) / 60_000 + 1,

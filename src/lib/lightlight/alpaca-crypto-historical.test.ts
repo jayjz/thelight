@@ -115,6 +115,17 @@ describe("BTC historical market-data client", () => {
     const short = analyzeBootstrapCoverage(fiftyNine.map(value => ({ t: Date.parse(value.t), open: value.o, high: value.h, low: value.l, close: value.c, volume: value.v })), { symbol: "BTC/USD", startMs, endMs });
     assert.equal(short.qualifies, false); assert.equal(short.verifiedContiguousMinuteCount, MIN_BOOTSTRAP_VERIFIED_MINUTES - 1);
   });
+  it("qualifies the latest returned 60-minute suffix when the requested end minute is absent", () => {
+    const endMs = t;
+    const returned = Array.from({ length: 60 }, (_, index) => ({ t: endMs - (60 - index) * 60_000, open: 100, high: 102, low: 99, close: 101, volume: 0 }));
+    const coverage = analyzeBootstrapCoverage(returned, { symbol: "BTC/USD", startMs: endMs - 60 * 60_000, endMs });
+    assert.equal(coverage.missingMinuteCount, 1);
+    assert.deepEqual(coverage.missingRanges, [{ startMs: endMs, endMs }]);
+    assert.equal(coverage.verifiedContiguousMinuteCount, 60);
+    assert.equal(coverage.verifiedThroughMs, endMs - 60_000);
+    assert.equal(coverage.verifiedStartMs, endMs - 60 * 60_000);
+    assert.equal(coverage.qualifies, true);
+  });
   it("rejects incomplete minute, nonaligned, wrong-symbol and over-horizon requests before GET", async () => {
     let calls = 0; const c = client(async () => { calls++; return response(); });
     for (const request of [{ ...interval(), startMs: t + 1 }, interval(t + 600_000), { ...interval(), startMs: t - 24 * 60 * 60_000 }, { ...interval(), symbol: "ETH/USD" as "BTC/USD" }]) await assert.rejects(c.fetchCompletedBars(request), errorCode("PROTOCOL_FAILURE"));

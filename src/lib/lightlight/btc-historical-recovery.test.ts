@@ -133,6 +133,26 @@ describe("verified BTC recovery", () => {
       assert.equal(s.store.marketObservations().filter(observation => observation.origin === "REST_BACKFILL").length, 1433);
     } finally { await s.worker.stop(); }
   });
+  it("qualifies a 60-bar cold bootstrap ending before the requested end without persisting a synthetic bar", async () => {
+    const s = setup();
+    s.historical.fetchCompletedBars = async range => sequence(range).filter(candidate => candidate.t >= range.endMs - 60 * 60_000 && candidate.t < range.endMs);
+    try {
+      await s.worker.start();
+      const checkpoint = (await s.checkpoint())!;
+      const bootstrap = checkpoint.marketEvidence?.bootstrap;
+      assert.ok(bootstrap);
+      assert.equal(s.worker.snapshot().state, "READY");
+      assert.equal(checkpoint.marketEvidence?.continuity, "VERIFIED");
+      assert.equal(bootstrap.verifiedContiguousMinuteCount, 60);
+      assert.equal(bootstrap.verifiedThroughMs, t - 60_000);
+      assert.equal(bootstrap.verifiedStartMs, t - 60 * 60_000);
+      assert.equal(bootstrap.missingMinuteCount, 1380);
+      assert.ok(bootstrap.missingRanges.some(range => range.startMs === t && range.endMs === t));
+      const persisted = await s.store.listClosedBars("BTC/USD");
+      assert.equal(persisted.length, 60);
+      assert.equal(persisted.some(candidate => candidate.t === t), false);
+    } finally { await s.worker.stop(); }
+  });
   for (const minuteCount of [MIN_BOOTSTRAP_VERIFIED_MINUTES, MIN_BOOTSTRAP_VERIFIED_MINUTES - 1]) it(`cold bootstrap ${minuteCount} contiguous minutes ${minuteCount === MIN_BOOTSTRAP_VERIFIED_MINUTES ? "qualifies" : "fails closed"}`, async () => {
     const s = setup();
     s.historical.fetchCompletedBars = async range => sequence(range).filter(candidate => candidate.t >= range.endMs - (minuteCount - 1) * 60_000);
