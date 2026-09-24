@@ -147,11 +147,13 @@ with zero broker authority or order submission. The operational bar-age limit is
 three minutes, active 24/7. Verified historical crypto recovery uses the Alpaca US
 bars endpoint, exact
 inclusive minute requests, complete pagination and REST_BACKFILL provenance.
-Startup is bounded to 24 hours and skips already verified durable intervals;
-live gaps are repaired before the next bar is accepted. Recovery/checkpoint
-writes are fenced. Incomplete or conflicting recovery remains GAP_DETECTED and
-halts; only exact durable verification produces VERIFIED. Zero-volume bars are
-valid. No migration or broker authority is added. Stop using SIGINT/SIGTERM. See the
+Startup is bounded to 24 hours and skips already verified durable intervals.
+Sparse provider history is retained without synthesis; cold start qualifies only
+the newest contiguous 60-minute suffix. Live gaps are repaired before the next
+bar is accepted with exact recovery. Recovery/checkpoint writes are fenced.
+Incomplete or conflicting live recovery remains GAP_DETECTED and halts.
+Zero-volume bars are valid. No migration or broker authority is added. Stop using
+SIGINT/SIGTERM. See the
 [BTC soak procedure](BTC_PAPER_RUNTIME.md#24h--72h-soak-procedure).
 
 24h/72h observation soak is pending. The next BTC milestone is PAPER execution

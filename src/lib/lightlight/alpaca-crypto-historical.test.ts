@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { AlpacaCryptoHistoricalBarsClient, ALPACA_CRYPTO_BARS_URL, CryptoHistoricalError } from "./alpaca-crypto-historical.server.ts";
+import { AlpacaCryptoHistoricalBarsClient, ALPACA_CRYPTO_BARS_URL, CryptoHistoricalError, MIN_BOOTSTRAP_VERIFIED_MINUTES, analyzeBootstrapCoverage, verifyExactBars } from "./alpaca-crypto-historical.server.ts";
 
 const t = Date.parse("2026-01-04T12:00:00Z");
 const raw = (time = t, volume = 2) => ({ t: new Date(time).toISOString(), o: 100, h: 102, l: 99, c: 101, v: volume });
@@ -100,8 +100,20 @@ describe("BTC historical market-data client", () => {
     let calls = 0;
     await assert.rejects(client(async () => ++calls === 1 ? response([raw()], "next") : response([{ ...raw(), c: 100 }])).fetchCompletedBars(interval()), errorCode("CONFLICT"));
   });
-  it("fails on missing minutes including an empty result", async () => {
-    for (const bars of [[], [raw()]]) await assert.rejects(client(async () => response(bars)).fetchCompletedBars(interval(t + 60_000)), errorCode("INCOMPLETE_RECOVERY"));
+  it("preserves provider-absent minutes for bootstrap analysis while exact repair remains strict", async () => {
+    const sparse = await client(async () => response([raw()])).fetchCompletedBars(interval(t + 60_000));
+    assert.deepEqual(sparse.map(bar => bar.t), [t]);
+    assert.throws(() => verifyExactBars(sparse, interval(t + 60_000)), errorCode("INCOMPLETE_RECOVERY"));
+  });
+  it("qualifies only a suffix at the frozen bootstrap threshold", () => {
+    const startMs = t - (MIN_BOOTSTRAP_VERIFIED_MINUTES + 2) * 60_000;
+    const endMs = t;
+    const sixty = Array.from({ length: MIN_BOOTSTRAP_VERIFIED_MINUTES }, (_, index) => raw(endMs - (MIN_BOOTSTRAP_VERIFIED_MINUTES - 1 - index) * 60_000));
+    const coverage = analyzeBootstrapCoverage(sixty.map(value => ({ t: Date.parse(value.t), open: value.o, high: value.h, low: value.l, close: value.c, volume: value.v })), { symbol: "BTC/USD", startMs, endMs });
+    assert.equal(coverage.qualifies, true); assert.equal(coverage.verifiedContiguousMinuteCount, MIN_BOOTSTRAP_VERIFIED_MINUTES);
+    const fiftyNine = coverage.verifiedStartMs === null ? [] : sixty.slice(1);
+    const short = analyzeBootstrapCoverage(fiftyNine.map(value => ({ t: Date.parse(value.t), open: value.o, high: value.h, low: value.l, close: value.c, volume: value.v })), { symbol: "BTC/USD", startMs, endMs });
+    assert.equal(short.qualifies, false); assert.equal(short.verifiedContiguousMinuteCount, MIN_BOOTSTRAP_VERIFIED_MINUTES - 1);
   });
   it("rejects incomplete minute, nonaligned, wrong-symbol and over-horizon requests before GET", async () => {
     let calls = 0; const c = client(async () => { calls++; return response(); });

@@ -74,11 +74,20 @@ duplicates fail closed. The client has no broker dependency or configurable host
 See [Alpaca's endpoint contract](https://docs.alpaca.markets/us/reference/cryptobars-1).
 
 On startup, acquire ownership and read the latest durable BTC bar, bounded bar
-history and prior checkpoint. The verification scope ends at the last completed
+history and prior checkpoint. The bootstrap scope ends at the last completed
 minute and begins no earlier than 1,439 minutes before it (24 hours inclusive).
-An existing verified prefix or first available durable bar can shorten this scope.
-Cold start or data older than the horizon uses the whole bounded window. Only
-missing or previously unverified contiguous ranges are fetched; an already
+Cold start fetches that bounded scope, validates every returned provider bar,
+records each actual bar as `REST_BACKFILL`, and records provider-absent minutes
+and ranges as bootstrap evidence. It never synthesizes OHLCV. Alpaca historical
+crypto data may be sparse before LIGHTLIGHT owns the live stream, so bootstrap
+certifies only the newest contiguous returned suffix ending at that completed
+minute. `MIN_BOOTSTRAP_VERIFIED_MINUTES = 60`: fewer than 60 consecutive minutes
+fails closed; 60 or more permits READY with `verifiedStartMs` and
+`verifiedThroughMs` limited to that suffix. Older sparse history remains visible
+but outside VERIFIED continuity.
+
+An existing verified suffix can shorten the rolling read. Only missing or
+previously unverified contiguous ranges after that suffix are fetched; an already
 complete verified interval requires no REST request. Bars inserted before a crash
 but beyond the verified checkpoint are checked against REST, not silently trusted.
 History older than the reported `verifiedStartMs` is not certified.
@@ -90,10 +99,12 @@ durable range, and then accept 12:04 as LIVE_WS. Gaps exceeding 24 hours halt;
 a restart can establish a new explicitly bounded scope. There is no strategy or
 dispatch barrier in this market-only worker.
 
-Every expected minute timestamp must have exactly one matching valid bar. Positive
-finite OHLC, valid high/low bounds, aligned provider minute timestamps and finite
-nonnegative volume are mandatory. Identical duplicates collapse idempotently;
-conflicting evidence is never overwritten. Zero-volume bars are valid: Alpaca
+Every returned minute must have one valid, aligned provider bar. Positive finite
+OHLC, valid high/low bounds and finite nonnegative volume are mandatory.
+Identical duplicates collapse idempotently; conflicting evidence is never
+overwritten. Once LIGHTLIGHT has VERIFIED continuity, every expected minute in a
+new live-gap repair must also be returned in exact timestamp order; an incomplete
+or conflicting live repair halts. Zero-volume bars are valid: Alpaca
 can use quote midpoint prices when no trade occurs, per its
 [historical crypto documentation](https://docs.alpaca.markets/us/docs/historical-crypto-data-1).
 REST parsing is separate from WebSocket b/u message parsing.
@@ -103,9 +114,13 @@ evidence; `market_bar_observations` records LIVE_WS versus REST_BACKFILL, provid
 timestamp and recovery-attempt ID. `market_gap_recovery_attempts` retains its
 existing **half-open** storage bounds: a one-minute request at 12:01 is stored as
 [12:01,12:02). This does not widen the provider request. The checkpoint's recovery
-summary includes the explicit inclusive `requestedStartMs`/`requestedEndMs`,
+summary distinguishes `BOOTSTRAP_QUALIFICATION` from `EXACT_LIVE_GAP_REPAIR` and
+includes the explicit inclusive `requestedStartMs`/`requestedEndMs`,
 requested/fetched/accepted/identical/conflicting counts, result/reason and times.
-Older attempt counts can be derived from its bounds and linked observations.
+Bootstrap evidence additionally retains provider-returned count, missing-minute
+and range counts, the ranges themselves, verified suffix bounds and contiguous
+minute count. Older attempt counts can be derived from its bounds and linked
+observations.
 
 BTC observation, recovery-attempt and checkpoint writes acquire the current
 lease row lock inside one transaction and validate run ID, fencing token and
@@ -153,15 +168,17 @@ A delayed minute degrades health without halting or changing a strategy threshol
 Freshness, subscribed status and a live lease are separate evidence; a checkpoint
 heartbeat alone is not evidence of new bars. Database time drives observer ages.
 
-Continuity is UNVERIFIED until historical verification establishes a bounded
-scope, GAP_DETECTED during recovery or failure, and VERIFIED only after exact
-response and durable interval checks. Adjacent valid live bars extend that
-verified chronology. The observer reports continuity, verification bounds,
-active/last attempt, inclusive requested range, counts, result/reason and whether
-historical continuity is verified. UNVERIFIED and GAP_DETECTED degrade health.
+Continuity is UNVERIFIED before bootstrap begins, GAP_DETECTED during bootstrap,
+recovery or failure, and VERIFIED only for the provider-backed suffix or exact
+post-verification repair. Adjacent valid live bars
+extend that verified chronology. The observer reports continuity, verification
+bounds, bootstrap sparse-history evidence, active/last recovery kind, inclusive
+requested range, counts, result/reason and whether historical continuity is
+verified. UNVERIFIED and GAP_DETECTED degrade health.
 
-A failed, incomplete or conflicting recovery halts and preserves GAP_DETECTED;
-the arriving live bar is not accepted. Restart re-verifies the unresolved range; a prior live-bar conflict invalidates
+A failed bootstrap qualification, or failed incomplete/conflicting exact live
+recovery, halts and preserves GAP_DETECTED; the arriving live bar is not accepted.
+Restart re-verifies the unresolved range; a prior live-bar conflict invalidates
 the trusted prefix and requires REST revalidation. Conflict invalidation is
 committed atomically with the observation result, including across a crash or
 ownership loss before the worker can persist its terminal halt.

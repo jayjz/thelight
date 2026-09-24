@@ -252,9 +252,10 @@ Completed for BTC/USD:
 - continuous BTC/USD observer/runtime via `btc:worker -- start` and `btc:observe`;
 - durable lifecycle, owned checkpoint, bounded reconnect and restart evidence;
 - explicit 24/7 operational freshness;
-- bounded exact BTC historical recovery at startup and live gaps, complete pagination,
+- bounded sparse BTC bootstrap recovery that qualifies only a recent contiguous
+  60-minute suffix, exact live-gap recovery, complete pagination,
   LIVE_WS/REST_BACKFILL provenance, fenced completion and VERIFIED continuity;
-- valid zero-volume bars and fail-closed incomplete/conflicting recovery, with
+- valid zero-volume bars and fail-closed incomplete/conflicting live recovery, with
   active/last recovery evidence in the observer.
 
 Recovery is limited to 24 hours; older history and provider revisions are not
