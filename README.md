@@ -32,7 +32,7 @@ The repository now contains both a research plane and a PAPER execution plane.
 | IWM / 1Min | bounded equity runtime | `ema_rsi_v1` | read-only durable evidence |
 | AAPL / 1Min | bounded equity runtime | `ema_rsi_v1` | read-only durable evidence |
 | MSFT / 1Min | bounded equity runtime | `ema_rsi_v1` | read-only durable evidence |
-| BTC/USD | Alpaca crypto market data | runtime/evidence foundation | read-only durable evidence |
+| BTC/USD / 1Min observations | continuous Alpaca crypto WebSocket | market evidence only | READ_ONLY_DURABLE; broker authority NONE |
 
 Only SPY currently has broker dispatch authority. Multi-equity and BTC capability boundaries are intentionally narrower than their market-data/evidence capabilities.
 
@@ -76,6 +76,29 @@ The ownership integration suite uses a real configured database and makes no Alp
 ```sh
 npm run test:alpaca-worker-ownership
 ```
+
+## BTC/USD 24/7 observation
+
+```sh
+npm run btc:worker -- start
+npm run btc:observe -- --once
+npm run btc:observe
+```
+
+The worker requires durable `DATABASE_URL` and `ALPACA_API_KEY_ID` /
+`ALPACA_API_SECRET_KEY`; native Node environment loading reads an optional `.env`
+without overriding host variables. Apply existing migrations before first start.
+Run on an always-on host; stop gracefully with SIGINT (Ctrl+C) or SIGTERM.
+The observer only needs `DATABASE_URL` and opens a read-only database session.
+
+BTC has **zero broker authority and zero order submission**. It persists completed
+BTC/USD minute bars, worker runs, a fenced lease and an owned checkpoint. Reconnect
+is bounded inside the source; restart uses a new run and preserves prior evidence.
+The observer reports lease, subscription, bar/checkpoint freshness, reconnect and
+halt evidence. A three-minute bar-age threshold is operational only, active 24/7.
+Historical crypto backfill is unsupported; gaps remain visible uncertainty.
+See [BTC operation and soak procedure](docs/BTC_PAPER_RUNTIME.md#247-read-only-operation).
+Next BTC milestone: PAPER execution after an observation soak, not strategy optimization.
 
 ## PAPER operation
 
@@ -135,7 +158,7 @@ See [docs/ALPACA_PAPER_WORKER.md](docs/ALPACA_PAPER_WORKER.md) for authority, re
 - [Evidence contract](docs/EVIDENCE_CONTRACT.md) — decision/execution provenance and immutability.
 - [Experiment contract](docs/EXPERIMENT_CONTRACT.md) — reproducibility and controlled-comparison rules.
 - [Alpaca PAPER worker](docs/ALPACA_PAPER_WORKER.md) — dispatch authority, reconciliation, persistence, and operator controls.
-- [BTC PAPER runtime](docs/BTC_PAPER_RUNTIME.md) — B0-B3 read-only crypto/runtime work and deferred execution scope.
+- [BTC PAPER runtime](docs/BTC_PAPER_RUNTIME.md) — B0-B3 foundation, continuous read-only operation, soak procedure and deferred execution scope.
 - [Relay capability](docs/lightlight-relay-capability.md) — bounded single-upstream equity subscription contract.
 - [Execution model](docs/EXECUTION_MODEL.md) — causal fills, accounting, and unknown execution state.
 - [Roadmap](docs/ROADMAP.md) — current milestones and sequencing.

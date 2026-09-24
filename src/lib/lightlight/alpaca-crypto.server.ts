@@ -3,11 +3,10 @@ import type { ClosedBar } from "./types.ts";
 import { BTC_USD_SPEC } from "./assets.ts";
 import {
   AlpacaTransportError,
-  type AlpacaConfig,
   type WebSocketFactory,
   type WebSocketLike,
   websocketPayloadToText,
-} from "./alpaca.server.ts";
+} from "./alpaca-transport.ts";
 
 /** Alpaca's dedicated US crypto market-data stream; this is not a trading URL. */
 export const ALPACA_CRYPTO_STREAM_URL = "wss://stream.data.alpaca.markets/v1beta3/crypto/us";
@@ -41,6 +40,20 @@ export type AlpacaCryptoMarketSnapshot = {
   lastError: string | null;
 };
 
+export type AlpacaCryptoCredentials = { apiKeyId: string; apiSecretKey: string };
+
+export function loadAlpacaCryptoCredentials(env: NodeJS.ProcessEnv = process.env): AlpacaCryptoCredentials {
+  const apiKeyId = env.ALPACA_API_KEY_ID?.trim();
+  const apiSecretKey = env.ALPACA_API_SECRET_KEY?.trim();
+  if (!apiKeyId || !apiSecretKey) throw new Error("ALPACA_MARKET_DATA_CREDENTIALS_REQUIRED");
+  return { apiKeyId, apiSecretKey };
+}
+
+export const CRYPTO_MAX_RECONNECT_ATTEMPTS = 8;
+export const CRYPTO_HANDSHAKE_TIMEOUT_MS = 10_000;
+export const cryptoReconnectDelayMs = (attempt: number): number => Math.min(30_000, 250 * 2 ** (attempt - 1));
+const MAX_QUEUED_BARS = 120;
+
 type Sleep = (milliseconds: number) => Promise<void>;
 
 const defaultSleep: Sleep = (milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
@@ -62,7 +75,7 @@ export function closedBarFromAlpacaCrypto(
   const timestamp = Date.parse(message.t);
   const values = [message.o, message.h, message.l, message.c, message.v];
   if (
-    !Number.isFinite(timestamp) ||
+    !Number.isFinite(timestamp) || timestamp % 60_000 !== 0 ||
     values.some((value) => !Number.isFinite(value)) ||
     message.o <= 0 || message.h <= 0 || message.l <= 0 || message.c <= 0 || message.v < 0 ||
     !Number.isFinite(now)
@@ -85,7 +98,7 @@ export function closedBarFromAlpacaCrypto(
  */
 export class AlpacaCryptoMarketSource implements MarketSource {
   readonly id = "alpaca:crypto:BTC/USD:1Min";
-  private readonly config: AlpacaConfig;
+  private readonly config: AlpacaCryptoCredentials;
   private readonly createSocket: WebSocketFactory;
   private readonly now: () => number;
   private readonly reconnectDelayMs: (attempt: number) => number;
@@ -97,6 +110,9 @@ export class AlpacaCryptoMarketSource implements MarketSource {
   private lastError: string | null = null;
   private socket: WebSocketLike | null = null;
   private running = false;
+  private consumed = false;
+  private cancelBackoff: (() => void) | null = null;
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   private reconnectScheduled = false;
   private terminalFailure: Error | null = null;
@@ -105,10 +121,10 @@ export class AlpacaCryptoMarketSource implements MarketSource {
   private messageQueue: Promise<void> = Promise.resolve();
 
   constructor(
-    config: AlpacaConfig,
+    config: AlpacaCryptoCredentials,
     createSocket: WebSocketFactory = (url) => new WebSocket(url),
     now: () => number = Date.now,
-    reconnectDelayMs: (attempt: number) => number = (attempt) => Math.min(30_000, 250 * 2 ** (attempt - 1)),
+    reconnectDelayMs: (attempt: number) => number = cryptoReconnectDelayMs,
     sleep: Sleep = defaultSleep,
   ) {
     this.config = config;
@@ -130,6 +146,11 @@ export class AlpacaCryptoMarketSource implements MarketSource {
 
   close(): void {
     if (!this.running && this.state === "CLOSED") return;
+    this.clearHandshake();
+    this.cancelBackoff?.();
+    this.cancelBackoff = null;
+    this.subscriptionAcknowledged = false;
+    this.queue = [];
     this.closed = true;
     this.running = false;
     this.generation += 1;
@@ -141,7 +162,8 @@ export class AlpacaCryptoMarketSource implements MarketSource {
   }
 
   async *bars(): AsyncIterable<ClosedBar> {
-    if (this.running) throw new Error("ALPACA_CRYPTO_SOURCE_ALREADY_CONSUMED");
+    if (this.consumed) throw new Error("ALPACA_CRYPTO_SOURCE_ALREADY_CONSUMED");
+    this.consumed = true;
     this.running = true;
     this.closed = false;
     this.terminalFailure = null;
@@ -172,6 +194,7 @@ export class AlpacaCryptoMarketSource implements MarketSource {
   private connect(generation: number): void {
     if (!this.running || this.closed || generation !== this.generation) return;
     this.state = "CONNECTING";
+    this.messageQueue = Promise.resolve();
     let authSent = false;
     let subscriptionSent = false;
     let connectionActive = true;
@@ -182,12 +205,14 @@ export class AlpacaCryptoMarketSource implements MarketSource {
     const transportFailure = (message: string) => {
       if (stale()) return;
       connectionActive = false;
-      this.socket = null;
+      this.clearHandshake();
       this.lastError = message;
       this.scheduleReconnect(generation);
       socket.close();
     };
+    this.handshakeTimer = setTimeout(() => transportFailure("Alpaca crypto handshake timed out."), CRYPTO_HANDSHAKE_TIMEOUT_MS);
     socket.addEventListener("message", (event) => {
+      if (stale()) return;
       this.messageQueue = this.messageQueue.then(async () => {
         if (stale()) return;
         try {
@@ -219,15 +244,15 @@ export class AlpacaCryptoMarketSource implements MarketSource {
               if (!subscriptionSent || !Array.isArray(bars) || bars.length !== 1 || bars[0] !== BTC_USD_SPEC.symbol) {
                 throw new AlpacaTransportError("SUBSCRIPTION_FAILURE", "Alpaca BTC/USD bars subscription was not acknowledged exactly.");
               }
+              this.clearHandshake();
               this.subscriptionAcknowledged = true;
               this.state = "SUBSCRIBED";
-              this.reconnectAttempt = 0;
               continue;
             }
             if (message.T === "error") {
               const code = Number(message.code);
-              const detail = String(message.msg ?? "Alpaca crypto stream error.");
-              if (code === 401 || code === 402 || code === 403) {
+              const detail = `Alpaca crypto stream error code ${Number.isFinite(code) ? code : "unknown"}.`;
+              if (code === 401 || code === 402 || code === 403 || code === 404 || code === 409) {
                 throw new AlpacaTransportError("AUTHENTICATION_FAILURE", detail);
               }
               if (subscriptionSent && !this.subscriptionAcknowledged) {
@@ -238,7 +263,11 @@ export class AlpacaCryptoMarketSource implements MarketSource {
             if (message.T === "b") {
               if (!this.subscriptionAcknowledged) throw protocolError("Alpaca BTC/USD bar arrived before subscription acknowledgement.");
               const bar = closedBarFromAlpacaCrypto(message as unknown as AlpacaCryptoBarMessage, this.now());
-              if (bar) this.queue.push(bar);
+              if (bar) {
+                if (this.queue.length >= MAX_QUEUED_BARS) throw protocolError("Alpaca crypto consumer queue overflow.");
+                this.reconnectAttempt = 0;
+                this.queue.push(bar);
+              }
             }
             // Trades, quotes, daily bars, updated bars, and unrelated symbols
             // never enter the normalized completed-bar pipeline.
@@ -256,6 +285,11 @@ export class AlpacaCryptoMarketSource implements MarketSource {
 
   private failTerminal(error: Error, generation: number): void {
     if (this.closed || generation !== this.generation || this.terminalFailure) return;
+    this.clearHandshake();
+    this.cancelBackoff?.();
+    this.cancelBackoff = null;
+    this.subscriptionAcknowledged = false;
+    this.queue = [];
     this.terminalFailure = error;
     this.lastError = error.message;
     this.state = "FAILED";
@@ -263,10 +297,21 @@ export class AlpacaCryptoMarketSource implements MarketSource {
     this.reconnectScheduled = false;
     this.socket?.close();
     this.socket = null;
+    this.signal();
+  }
+
+  private clearHandshake(): void {
+    if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
+    this.handshakeTimer = null;
   }
 
   private scheduleReconnect(failedGeneration: number): void {
     if (this.closed || !this.running || failedGeneration !== this.generation || this.reconnectScheduled) return;
+    if (this.reconnectAttempt >= CRYPTO_MAX_RECONNECT_ATTEMPTS) {
+      this.failTerminal(new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca crypto reconnect budget exhausted."), failedGeneration);
+      return;
+    }
+    this.queue = [];
     this.reconnectScheduled = true;
     this.state = "RECONNECTING";
     this.subscriptionAcknowledged = false;
@@ -274,11 +319,25 @@ export class AlpacaCryptoMarketSource implements MarketSource {
     const attempt = ++this.reconnectAttempt;
     const delay = Math.max(0, this.reconnectDelayMs(attempt));
     void (async () => {
-      await this.sleep(delay);
+      if (this.sleep === defaultSleep) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, delay);
+          this.cancelBackoff = () => { clearTimeout(timer); resolve(); };
+        });
+        this.cancelBackoff = null;
+      } else await this.sleep(delay);
+      // Do not overlap physical sockets even when close() completes slowly.
+      const closingDeadline = Date.now() + CRYPTO_HANDSHAKE_TIMEOUT_MS;
+      while (this.socket?.readyState !== undefined && this.socket.readyState !== 3) {
+        if (this.closed || generation !== this.generation) return;
+        if (Date.now() >= closingDeadline) throw new Error("Alpaca crypto socket close timed out.");
+        await defaultSleep(25);
+      }
       if (this.closed || !this.running || generation !== this.generation) return;
       this.reconnectScheduled = false;
+      this.socket = null;
       this.connect(generation);
-    })();
+    })().catch(() => this.failTerminal(new AlpacaTransportError("DISCONNECTED_STREAM", "Alpaca crypto reconnect failed."), generation));
     this.signal();
   }
 

@@ -9,6 +9,131 @@ invariants already established for SPY.
 This phase proves crypto execution infrastructure. It does not claim that the
 existing SPY strategy or thresholds are valid for BTC.
 
+## 24/7 read-only operation
+
+The production-shaped observer slice extends B0-B3. Its complete active path is:
+
+```text
+Alpaca BTC/USD crypto WebSocket -> completed 1Min bars -> DurableMarketWorker
+  -> Postgres/Neon closed_bars + market_bar_observations
+  -> owned runtime_checkpoint + worker_runs + worker_leases
+  -> read-only terminal observer
+```
+
+**READ_ONLY_DURABLE / MARKET_EVIDENCE_ONLY. BROKER AUTHORITY: NONE.**
+The canonical `BTC_USD_RUNTIME_IDENTITY` is unchanged, including its compatibility
+worker key `alpaca-paper:BTC/USD:15Min:alpaca-paper-worker-v1`. The `15Min` label is
+inherited identity metadata; this service only records completed 1Min bars and
+creates no strategy decisions or execution intents. No broker module, trading
+REST endpoint, order submission, position reconciliation or trade-update
+subscription is reachable from the BTC operator import graph. Shared transport
+primitives are isolated from the existing equity broker implementation.
+
+```sh
+npm run btc:worker -- start
+npm run btc:observe -- --once
+npm run btc:observe
+```
+
+Use Node 22 on an always-on host, with existing migrations applied. Both commands
+load an optional `.env` using `--env-file-if-exists`; exported host values take
+precedence. Worker requirements: durable `DATABASE_URL`, `ALPACA_API_KEY_ID` and
+`ALPACA_API_SECRET_KEY`. The observer requires only `DATABASE_URL`; it uses a
+read-only database session and transaction, and never connects to Alpaca or
+acquires/renews a lease. A SELECT-only database role is suitable for the observer.
+Database connection/statement/query timeouts are ten seconds. Vercel cannot run
+the worker. No process-manager dependency is introduced.
+
+Startup creates a new run, acquires a 30-second BTC lease, recovers the checkpoint
+and durable bars, then connects. READY requires subscription acknowledgement and
+a persisted READY run. A referenced heartbeat keeps the process alive, renews
+ownership every ten seconds and persists stream status changes (observed every
+second) plus ten-second checkpoint heartbeats. Stop with Ctrl+C, SIGINT or
+SIGTERM. Graceful stop closes the source, drains serialized writes, persists
+STOPPED and releases ownership. HALTED is preserved as terminal evidence during
+cleanup and exits nonzero. Signals are handled during startup as well.
+
+Only the source reconnects: exponential delays of 250ms, 500ms, 1s, 2s, 4s, 8s,
+16s, then 30s, with at most eight consecutive replacement attempts. Receiving a
+valid completed bar resets the budget; acknowledgement alone does not reset it.
+Each generation authenticates and subscribes to exactly BTC/USD bars. A ten-second
+handshake deadline reconnects stalled transports; a socket must close before its
+replacement opens (ten-second close deadline). Old callbacks and queued bars are
+invalidated on replacement. Auth, subscription and malformed/protocol failures
+are terminal. Completed-bar queues are bounded at 120; overflow halts rather than
+silently losing evidence. There is no process-level reconnect loop.
+
+Restart inspects the newest persisted BTC timestamp and at most the preceding
+24 hours of bars (1,440 one-minute timestamps). The recovered count is for that
+bounded window, not lifetime storage. A bar inserted before a crash but ahead of
+the checkpoint repairs the latest timestamp on restart. Bar identity remains
+`(symbol, timestamp_ms)`; identical duplicates are idempotent and conflicting
+OHLCV evidence halts. Old runs are preserved; an abandoned active predecessor is
+marked SUPERSEDED only by the existing database lease takeover semantics. A
+crashed owner must expire before replacement. Stale fencing cannot update the
+checkpoint. Historical rows are never reconstructed or deleted.
+
+### Health and continuity
+
+The durable worker states remain STARTING, READY, HALTED and STOPPED. DEGRADED is
+an observer projection, never a new persisted lifecycle state. Output includes
+symbol, capability/reason, worker key, run/lease owner, token, database-time lease
+expiration/live status, crypto stream state, acknowledgement, latest bar/time
+age, checkpoint update/age/caught-up status, last advancing bar persistence time,
+recovered count/window, reconnect generation/attempt, stream error and halt reason.
+The lease owner's run takes precedence over a later rejected startup contender.
+
+`BTC_MAX_COMPLETED_BAR_AGE_MS = 180_000` measures age from the provider's minute
+**start** timestamp (one minute is already elapsed when the bar completes).
+`BTC_MAX_CHECKPOINT_AGE_MS = 30_000` bounds checkpoint heartbeat age. Thresholds
+are inclusive, tested, operational and apply around the clock, including weekends.
+A delayed minute degrades health without halting or changing a strategy threshold.
+Freshness, subscribed status and a live lease are separate evidence; a checkpoint
+heartbeat alone is not evidence of new bars. Database time drives observer ages.
+
+**No verified historical crypto backfill exists.** Continuity starts UNVERIFIED;
+a jump over missing minutes becomes sticky GAP_DETECTED and degrades health even
+after fresh bars resume. The service continues collecting later evidence, labels
+uncertainty and invents no missing bars. It cannot determine whether a missing
+minute represents absent provider activity or lost delivery. Updated bars (`u`)
+are excluded and old evidence is immutable. READY means current observation is
+healthy, not historically verified continuity. Storage failure halts; if the
+database itself is unavailable, durable failure recording may also fail, so the
+process logs `persistenceError` and exits nonzero and the lease expires.
+
+### 24h / 72h soak procedure
+
+1. Apply migrations, start one worker, save an initial `btc:observe -- --once`
+   snapshot and confirm subscribed state, a live lease and advancing BTC bars.
+2. Keep worker logs and observer samples externally for 24 hours. Sample at least
+   once per minute; inspect maximum bar/checkpoint age, reconnect attempts,
+   ownership stability and all continuity warnings. No trading smoke is needed.
+3. During a controlled maintenance window send SIGTERM, verify durable STOPPED
+   and an expired/released lease, then restart. Confirm a new run ID, larger fencing
+   token, recovered count and preserved bars/checkpoint. Repeat with SIGINT.
+4. In a controlled read-only soak, interrupt network access and restore it within
+   the reconnect budget. Confirm reauthentication/resubscription, one owner, no
+   overlapping sockets, advancing bars and explicit gaps. Exhaustion must HALT;
+   restart manually after the cause is resolved.
+5. Optionally terminate the worker abruptly, wait past its 30-second lease, then
+   restart. Confirm the predecessor is SUPERSEDED and no bars were duplicated.
+6. Extend to 72 hours including a weekend. Acceptance requires explainable gaps,
+   no silent stalls, no duplicate durable bars, correct terminal run states and
+   **zero decisions/intents/orders/positions created by BTC**. Archive observations
+   and investigate HALTED/DEGRADED episodes before authorizing the next milestone.
+
+This implementation is not a completed 24h/72h soak. The next milestone is BTC
+PAPER execution **after soak**, not strategy optimization. Out of scope: BTC PAPER
+order submission, fractional execution, crypto broker reconciliation, strategy
+calibration, cost/slippage tuning, ETH, portfolio execution and live-money trading.
+
+The retained manual `npm run alpaca:crypto-smoke` only observes one completed bar;
+it does not run a durable worker. Do not run it concurrently where Alpaca's
+connection allowance is one. Unit tests inject sockets and forbid real networking.
+The official [crypto stream contract](https://docs.alpaca.markets/us/docs/real-time-crypto-pricing-data)
+and [authentication/error contract](https://docs.alpaca.markets/us/docs/streaming-market-data)
+were checked on 2026-09-22.
+
 ## Branch scope
 
 Target progression:
@@ -17,6 +142,7 @@ Target progression:
 2. Introduce an explicit asset/runtime contract. **Complete (B1)**
 3. Add Alpaca crypto market-data transport. **Complete (B2)**
 4. Scope worker identity, leases, checkpoints, evidence, and broker state by asset. **Complete (B3)**
+   Continuous BTC market observation is implemented; observation soak remains pending.
 5. Add `BTC/USD` long-only fractional PAPER execution.
 6. Add BTC-specific deterministic risk and cost configuration.
 7. Exercise the complete BTC PAPER path.
@@ -40,6 +166,7 @@ AssetSpec
   -> Alpaca PAPER
   -> broker observations
   -> durable execution evidence
+```
 
 Shared infrastructure does not imply shared strategy parameters.
 

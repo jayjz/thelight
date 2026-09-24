@@ -241,14 +241,21 @@ This is a separate execution milestone, not an incidental flag change.
 
 # P7 — Crypto PAPER execution
 
-**Status: deferred after BTC B3**
+**Status: continuous read-only observation implemented; PAPER execution deferred until observation soak**
 
 Completed for BTC/USD:
 
 - B0: freeze SPY behavior;
 - B1: explicit asset/runtime contract;
 - B2: read-only Alpaca crypto market-data adapter;
-- B3: independent durable runtime identity, lease, checkpoint, and evidence namespace.
+- B3: independent durable runtime identity, lease, checkpoint, and evidence namespace;
+- continuous BTC/USD observer/runtime via `btc:worker -- start` and `btc:observe`;
+- durable lifecycle, owned checkpoint, bounded reconnect and restart evidence;
+- explicit 24/7 operational freshness and visible gap uncertainty (no crypto backfill).
+
+Run the [24h/72h observation soak](BTC_PAPER_RUNTIME.md#24h--72h-soak-procedure)
+before the next BTC milestone: PAPER execution. Stop with SIGINT/SIGTERM. BTC
+remains `READ_ONLY_DURABLE / MARKET_EVIDENCE_ONLY`, with zero broker authority.
 
 Not implemented:
 
