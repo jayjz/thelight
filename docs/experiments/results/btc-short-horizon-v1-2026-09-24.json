@@ -1,0 +1,1450 @@
+{
+  "schemaVersion": "btc-short-horizon-research-v1",
+  "experimentId": "btc_short_horizon_v1",
+  "frozenAt": "2026-09-24",
+  "symbol": "BTC/USD",
+  "timeframe": "1Min",
+  "executionModel": "NEXT_BAR_CLOSE/v1",
+  "data": {
+    "source": "DURABLE_VERIFIED",
+    "startMs": 1790208900000,
+    "endMs": 1790283300000,
+    "barCount": 1241,
+    "hash": "d17b37a071693e70d6bc4213d92cd5a4d365c42425a223101d95c48e6815aa49"
+  },
+  "partitions": {
+    "development": {
+      "startMs": 1790208900000,
+      "endMs": 1790260920000,
+      "barCount": 868
+    },
+    "validation": {
+      "startMs": 1790260980000,
+      "endMs": 1790283300000,
+      "barCount": 373
+    }
+  },
+  "strategies": {
+    "flat": [
+      {
+        "strategyId": "flat",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "fees_only",
+          "feeBpsPerSide": 25,
+          "spreadBpsPerSide": 0,
+          "slippageBpsPerSide": 0
+        },
+        "trades": [],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 0,
+          "completedRoundTrips": 0,
+          "tradesPerDay": 0,
+          "medianHoldingMinutes": null,
+          "turnover": 0,
+          "grossPnl": 0,
+          "netPnl": 0,
+          "averageTrade": null,
+          "medianTrade": null,
+          "hitRate": null,
+          "profitFactor": null,
+          "maxDrawdown": 0,
+          "exposure": 0,
+          "costPaid": 0,
+          "signalFlips": 0,
+          "returnPerUnitTurnover": null
+        },
+        "decisionDigest": "5dc105710df7287c4e2614061e7f8905490c8643aef137335249cef0b5c6bc6e"
+      },
+      {
+        "strategyId": "flat",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "spread_only",
+          "feeBpsPerSide": 0,
+          "spreadBpsPerSide": 2,
+          "slippageBpsPerSide": 0
+        },
+        "trades": [],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 0,
+          "completedRoundTrips": 0,
+          "tradesPerDay": 0,
+          "medianHoldingMinutes": null,
+          "turnover": 0,
+          "grossPnl": 0,
+          "netPnl": 0,
+          "averageTrade": null,
+          "medianTrade": null,
+          "hitRate": null,
+          "profitFactor": null,
+          "maxDrawdown": 0,
+          "exposure": 0,
+          "costPaid": 0,
+          "signalFlips": 0,
+          "returnPerUnitTurnover": null
+        },
+        "decisionDigest": "5dc105710df7287c4e2614061e7f8905490c8643aef137335249cef0b5c6bc6e"
+      },
+      {
+        "strategyId": "flat",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "slippage_only",
+          "feeBpsPerSide": 0,
+          "spreadBpsPerSide": 0,
+          "slippageBpsPerSide": 3
+        },
+        "trades": [],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 0,
+          "completedRoundTrips": 0,
+          "tradesPerDay": 0,
+          "medianHoldingMinutes": null,
+          "turnover": 0,
+          "grossPnl": 0,
+          "netPnl": 0,
+          "averageTrade": null,
+          "medianTrade": null,
+          "hitRate": null,
+          "profitFactor": null,
+          "maxDrawdown": 0,
+          "exposure": 0,
+          "costPaid": 0,
+          "signalFlips": 0,
+          "returnPerUnitTurnover": null
+        },
+        "decisionDigest": "5dc105710df7287c4e2614061e7f8905490c8643aef137335249cef0b5c6bc6e"
+      },
+      {
+        "strategyId": "flat",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "combined",
+          "feeBpsPerSide": 25,
+          "spreadBpsPerSide": 2,
+          "slippageBpsPerSide": 3
+        },
+        "trades": [],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 0,
+          "completedRoundTrips": 0,
+          "tradesPerDay": 0,
+          "medianHoldingMinutes": null,
+          "turnover": 0,
+          "grossPnl": 0,
+          "netPnl": 0,
+          "averageTrade": null,
+          "medianTrade": null,
+          "hitRate": null,
+          "profitFactor": null,
+          "maxDrawdown": 0,
+          "exposure": 0,
+          "costPaid": 0,
+          "signalFlips": 0,
+          "returnPerUnitTurnover": null
+        },
+        "decisionDigest": "5dc105710df7287c4e2614061e7f8905490c8643aef137335249cef0b5c6bc6e"
+      }
+    ],
+    "btc_momentum_baseline_v1": [
+      {
+        "strategyId": "btc_momentum_baseline_v1",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "fees_only",
+          "feeBpsPerSide": 25,
+          "spreadBpsPerSide": 0,
+          "slippageBpsPerSide": 0
+        },
+        "trades": [
+          {
+            "entryBarIndex": 854,
+            "entryTimestamp": 1790260140000,
+            "exitBarIndex": 859,
+            "exitTimestamp": 1790260440000,
+            "holdingBars": 5,
+            "grossLogReturn": -0.0011747284448996843,
+            "netLogReturn": -0.006174728444899686,
+            "cost": 0.005
+          },
+          {
+            "entryBarIndex": 962,
+            "entryTimestamp": 1790266620000,
+            "exitBarIndex": 967,
+            "exitTimestamp": 1790266920000,
+            "holdingBars": 5,
+            "grossLogReturn": -0.0016920707035240367,
+            "netLogReturn": -0.006692070703524037,
+            "cost": 0.005
+          }
+        ],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 2,
+          "completedRoundTrips": 2,
+          "tradesPerDay": 2.320709105560032,
+          "medianHoldingMinutes": 5,
+          "turnover": 4,
+          "grossPnl": -0.002862693803748262,
+          "netPnl": -0.012784375775307666,
+          "averageTrade": -0.0064333995742118615,
+          "medianTrade": -0.0064333995742118615,
+          "hitRate": 0,
+          "profitFactor": 0,
+          "maxDrawdown": 0.012784375775307666,
+          "exposure": 0.008064516129032258,
+          "costPaid": 0.01,
+          "signalFlips": 4,
+          "returnPerUnitTurnover": -0.0032166997871059307
+        },
+        "decisionDigest": "941d381ec49ce9f2d46e5b632bd457d42610a1cd19b17d343186a5f713a6a364"
+      },
+      {
+        "strategyId": "btc_momentum_baseline_v1",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "spread_only",
+          "feeBpsPerSide": 0,
+          "spreadBpsPerSide": 2,
+          "slippageBpsPerSide": 0
+        },
+        "trades": [
+          {
+            "entryBarIndex": 854,
+            "entryTimestamp": 1790260140000,
+            "exitBarIndex": 859,
+            "exitTimestamp": 1790260440000,
+            "holdingBars": 5,
+            "grossLogReturn": -0.0011747284448996843,
+            "netLogReturn": -0.0015747284448996844,
+            "cost": 0.0004
+          },
+          {
+            "entryBarIndex": 962,
+            "entryTimestamp": 1790266620000,
+            "exitBarIndex": 967,
+            "exitTimestamp": 1790266920000,
+            "holdingBars": 5,
+            "grossLogReturn": -0.0016920707035240367,
+            "netLogReturn": -0.0020920707035240373,
+            "cost": 0.0004
+          }
+        ],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 2,
+          "completedRoundTrips": 2,
+          "tradesPerDay": 2.320709105560032,
+          "medianHoldingMinutes": 5,
+          "turnover": 4,
+          "grossPnl": -0.002862693803748262,
+          "netPnl": -0.003660084649839357,
+          "averageTrade": -0.0018333995742118609,
+          "medianTrade": -0.0018333995742118609,
+          "hitRate": 0,
+          "profitFactor": 0,
+          "maxDrawdown": 0.004683317325080871,
+          "exposure": 0.008064516129032258,
+          "costPaid": 0.0008,
+          "signalFlips": 4,
+          "returnPerUnitTurnover": -0.0009166997871059304
+        },
+        "decisionDigest": "941d381ec49ce9f2d46e5b632bd457d42610a1cd19b17d343186a5f713a6a364"
+      },
+      {
+        "strategyId": "btc_momentum_baseline_v1",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "slippage_only",
+          "feeBpsPerSide": 0,
+          "spreadBpsPerSide": 0,
+          "slippageBpsPerSide": 3
+        },
+        "trades": [
+          {
+            "entryBarIndex": 854,
+            "entryTimestamp": 1790260140000,
+            "exitBarIndex": 859,
+            "exitTimestamp": 1790260440000,
+            "holdingBars": 5,
+            "grossLogReturn": -0.0011747284448996843,
+            "netLogReturn": -0.001774728444899684,
+            "cost": 0.0006
+          },
+          {
+            "entryBarIndex": 962,
+            "entryTimestamp": 1790266620000,
+            "exitBarIndex": 967,
+            "exitTimestamp": 1790266920000,
+            "holdingBars": 5,
+            "grossLogReturn": -0.0016920707035240367,
+            "netLogReturn": -0.0022920707035240366,
+            "cost": 0.0006
+          }
+        ],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 2,
+          "completedRoundTrips": 2,
+          "tradesPerDay": 2.320709105560032,
+          "medianHoldingMinutes": 5,
+          "turnover": 4,
+          "grossPnl": -0.002862693803748262,
+          "netPnl": -0.004058540919412712,
+          "averageTrade": -0.0020333995742118603,
+          "medianTrade": -0.0020333995742118603,
+          "hitRate": 0,
+          "profitFactor": 0,
+          "maxDrawdown": 0.004981867545111207,
+          "exposure": 0.008064516129032258,
+          "costPaid": 0.0012,
+          "signalFlips": 4,
+          "returnPerUnitTurnover": -0.0010166997871059302
+        },
+        "decisionDigest": "941d381ec49ce9f2d46e5b632bd457d42610a1cd19b17d343186a5f713a6a364"
+      },
+      {
+        "strategyId": "btc_momentum_baseline_v1",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "combined",
+          "feeBpsPerSide": 25,
+          "spreadBpsPerSide": 2,
+          "slippageBpsPerSide": 3
+        },
+        "trades": [
+          {
+            "entryBarIndex": 854,
+            "entryTimestamp": 1790260140000,
+            "exitBarIndex": 859,
+            "exitTimestamp": 1790260440000,
+            "holdingBars": 5,
+            "grossLogReturn": -0.0011747284448996843,
+            "netLogReturn": -0.007174728444899685,
+            "cost": 0.006
+          },
+          {
+            "entryBarIndex": 962,
+            "entryTimestamp": 1790266620000,
+            "exitBarIndex": 967,
+            "exitTimestamp": 1790266920000,
+            "holdingBars": 5,
+            "grossLogReturn": -0.0016920707035240367,
+            "netLogReturn": -0.007692070703524037,
+            "cost": 0.006
+          }
+        ],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 2,
+          "completedRoundTrips": 2,
+          "tradesPerDay": 2.320709105560032,
+          "medianHoldingMinutes": 5,
+          "turnover": 4,
+          "grossPnl": -0.002862693803748262,
+          "netPnl": -0.0147568339081382,
+          "averageTrade": -0.007433399574211861,
+          "medianTrade": -0.007433399574211861,
+          "hitRate": 0,
+          "profitFactor": 0,
+          "maxDrawdown": 0.0147568339081382,
+          "exposure": 0.008064516129032258,
+          "costPaid": 0.012,
+          "signalFlips": 4,
+          "returnPerUnitTurnover": -0.0037166997871059303
+        },
+        "decisionDigest": "941d381ec49ce9f2d46e5b632bd457d42610a1cd19b17d343186a5f713a6a364"
+      }
+    ],
+    "btc_momentum_v1": [
+      {
+        "strategyId": "btc_momentum_v1",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "fees_only",
+          "feeBpsPerSide": 25,
+          "spreadBpsPerSide": 0,
+          "slippageBpsPerSide": 0
+        },
+        "trades": [
+          {
+            "entryBarIndex": 962,
+            "entryTimestamp": 1790266620000,
+            "exitBarIndex": 964,
+            "exitTimestamp": 1790266740000,
+            "holdingBars": 2,
+            "grossLogReturn": -0.0029195899719392784,
+            "netLogReturn": -0.007919589971939279,
+            "cost": 0.005
+          }
+        ],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 1,
+          "completedRoundTrips": 1,
+          "tradesPerDay": 1.160354552780016,
+          "medianHoldingMinutes": 2,
+          "turnover": 2,
+          "grossPnl": -0.0029153321138783994,
+          "netPnl": -0.007888312641617823,
+          "averageTrade": -0.007919589971939279,
+          "medianTrade": -0.007919589971939279,
+          "hitRate": 0,
+          "profitFactor": 0,
+          "maxDrawdown": 0.007888312641617823,
+          "exposure": 0.0016129032258064516,
+          "costPaid": 0.005,
+          "signalFlips": 2,
+          "returnPerUnitTurnover": -0.003959794985969639
+        },
+        "decisionDigest": "8fbb83b2b4918c5f33e48d4cff9a7aad9c2beef1453ca1529473f2d695766f01"
+      },
+      {
+        "strategyId": "btc_momentum_v1",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "spread_only",
+          "feeBpsPerSide": 0,
+          "spreadBpsPerSide": 2,
+          "slippageBpsPerSide": 0
+        },
+        "trades": [
+          {
+            "entryBarIndex": 962,
+            "entryTimestamp": 1790266620000,
+            "exitBarIndex": 964,
+            "exitTimestamp": 1790266740000,
+            "holdingBars": 2,
+            "grossLogReturn": -0.0029195899719392784,
+            "netLogReturn": -0.0033195899719392786,
+            "cost": 0.0004
+          }
+        ],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 1,
+          "completedRoundTrips": 1,
+          "tradesPerDay": 1.160354552780016,
+          "medianHoldingMinutes": 2,
+          "turnover": 2,
+          "grossPnl": -0.0029153321138783994,
+          "netPnl": -0.0033140862248939307,
+          "averageTrade": -0.0033195899719392786,
+          "medianTrade": -0.0033195899719392786,
+          "hitRate": 0,
+          "profitFactor": 0,
+          "maxDrawdown": 0.0033140862248939307,
+          "exposure": 0.0016129032258064516,
+          "costPaid": 0.0004,
+          "signalFlips": 2,
+          "returnPerUnitTurnover": -0.0016597949859696393
+        },
+        "decisionDigest": "8fbb83b2b4918c5f33e48d4cff9a7aad9c2beef1453ca1529473f2d695766f01"
+      },
+      {
+        "strategyId": "btc_momentum_v1",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "slippage_only",
+          "feeBpsPerSide": 0,
+          "spreadBpsPerSide": 0,
+          "slippageBpsPerSide": 3
+        },
+        "trades": [
+          {
+            "entryBarIndex": 962,
+            "entryTimestamp": 1790266620000,
+            "exitBarIndex": 964,
+            "exitTimestamp": 1790266740000,
+            "holdingBars": 2,
+            "grossLogReturn": -0.0029195899719392784,
+            "netLogReturn": -0.0035195899719392782,
+            "cost": 0.0006
+          }
+        ],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 1,
+          "completedRoundTrips": 1,
+          "tradesPerDay": 1.160354552780016,
+          "medianHoldingMinutes": 2,
+          "turnover": 2,
+          "grossPnl": -0.0029153321138783994,
+          "netPnl": -0.0035134034752595245,
+          "averageTrade": -0.0035195899719392782,
+          "medianTrade": -0.0035195899719392782,
+          "hitRate": 0,
+          "profitFactor": 0,
+          "maxDrawdown": 0.0035134034752595245,
+          "exposure": 0.0016129032258064516,
+          "costPaid": 0.0006,
+          "signalFlips": 2,
+          "returnPerUnitTurnover": -0.0017597949859696391
+        },
+        "decisionDigest": "8fbb83b2b4918c5f33e48d4cff9a7aad9c2beef1453ca1529473f2d695766f01"
+      },
+      {
+        "strategyId": "btc_momentum_v1",
+        "strategyVersion": "v1",
+        "costScenario": {
+          "id": "combined",
+          "feeBpsPerSide": 25,
+          "spreadBpsPerSide": 2,
+          "slippageBpsPerSide": 3
+        },
+        "trades": [
+          {
+            "entryBarIndex": 962,
+            "entryTimestamp": 1790266620000,
+            "exitBarIndex": 964,
+            "exitTimestamp": 1790266740000,
+            "holdingBars": 2,
+            "grossLogReturn": -0.0029195899719392784,
+            "netLogReturn": -0.008919589971939278,
+            "cost": 0.006
+          }
+        ],
+        "metrics": {
+          "totalDecisions": 1221,
+          "entryCount": 1,
+          "completedRoundTrips": 1,
+          "tradesPerDay": 1.160354552780016,
+          "medianHoldingMinutes": 2,
+          "turnover": 2,
+          "grossPnl": -0.0029153321138783994,
+          "netPnl": -0.008879928438443208,
+          "averageTrade": -0.008919589971939278,
+          "medianTrade": -0.008919589971939278,
+          "hitRate": 0,
+          "profitFactor": 0,
+          "maxDrawdown": 0.008879928438443208,
+          "exposure": 0.0016129032258064516,
+          "costPaid": 0.006,
+          "signalFlips": 2,
+          "returnPerUnitTurnover": -0.004459794985969639
+        },
+        "decisionDigest": "8fbb83b2b4918c5f33e48d4cff9a7aad9c2beef1453ca1529473f2d695766f01"
+      }
+    ]
+  },
+  "partitionResults": {
+    "development": {
+      "flat": [
+        {
+          "strategyId": "flat",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "fees_only",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "5fc6135b7278843f94804ce89f9c44cf0d2c210dbe397f63d30d861502e2226b"
+        },
+        {
+          "strategyId": "flat",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "spread_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "5fc6135b7278843f94804ce89f9c44cf0d2c210dbe397f63d30d861502e2226b"
+        },
+        {
+          "strategyId": "flat",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "slippage_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "5fc6135b7278843f94804ce89f9c44cf0d2c210dbe397f63d30d861502e2226b"
+        },
+        {
+          "strategyId": "flat",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "combined",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "5fc6135b7278843f94804ce89f9c44cf0d2c210dbe397f63d30d861502e2226b"
+        }
+      ],
+      "btc_momentum_baseline_v1": [
+        {
+          "strategyId": "btc_momentum_baseline_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "fees_only",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [
+            {
+              "entryBarIndex": 854,
+              "entryTimestamp": 1790260140000,
+              "exitBarIndex": 859,
+              "exitTimestamp": 1790260440000,
+              "holdingBars": 5,
+              "grossLogReturn": -0.0011747284448996843,
+              "netLogReturn": -0.006174728444899686,
+              "cost": 0.005
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 1.6589861751152075,
+            "medianHoldingMinutes": 5,
+            "turnover": 2,
+            "grossPnl": -0.001174038721545756,
+            "netPnl": -0.006155703986311045,
+            "averageTrade": -0.006174728444899686,
+            "medianTrade": -0.006174728444899686,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.006155703986311045,
+            "exposure": 0.0057670126874279125,
+            "costPaid": 0.005,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.003087364222449843
+          },
+          "decisionDigest": "754aaa82490c8ac237ec61906dc34479043c5bc32de7cb631742fae13508f084"
+        },
+        {
+          "strategyId": "btc_momentum_baseline_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "spread_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [
+            {
+              "entryBarIndex": 854,
+              "entryTimestamp": 1790260140000,
+              "exitBarIndex": 859,
+              "exitTimestamp": 1790260440000,
+              "holdingBars": 5,
+              "grossLogReturn": -0.0011747284448996843,
+              "netLogReturn": -0.0015747284448996844,
+              "cost": 0.0004
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 1.6589861751152075,
+            "medianHoldingMinutes": 5,
+            "turnover": 2,
+            "grossPnl": -0.001174038721545756,
+            "netPnl": -0.001573489210633272,
+            "averageTrade": -0.0015747284448996844,
+            "medianTrade": -0.0015747284448996844,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.0016548834641032517,
+            "exposure": 0.0057670126874279125,
+            "costPaid": 0.0004,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.0007873642224498422
+          },
+          "decisionDigest": "754aaa82490c8ac237ec61906dc34479043c5bc32de7cb631742fae13508f084"
+        },
+        {
+          "strategyId": "btc_momentum_baseline_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "slippage_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [
+            {
+              "entryBarIndex": 854,
+              "entryTimestamp": 1790260140000,
+              "exitBarIndex": 859,
+              "exitTimestamp": 1790260440000,
+              "holdingBars": 5,
+              "grossLogReturn": -0.0011747284448996843,
+              "netLogReturn": -0.001774728444899684,
+              "cost": 0.0006
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 1.6589861751152075,
+            "medianHoldingMinutes": 5,
+            "turnover": 2,
+            "grossPnl": -0.001174038721545756,
+            "netPnl": -0.001773154545592126,
+            "averageTrade": -0.001774728444899684,
+            "medianTrade": -0.001774728444899684,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.001773154545592126,
+            "exposure": 0.0057670126874279125,
+            "costPaid": 0.0006,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.000887364222449842
+          },
+          "decisionDigest": "754aaa82490c8ac237ec61906dc34479043c5bc32de7cb631742fae13508f084"
+        },
+        {
+          "strategyId": "btc_momentum_baseline_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "combined",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [
+            {
+              "entryBarIndex": 854,
+              "entryTimestamp": 1790260140000,
+              "exitBarIndex": 859,
+              "exitTimestamp": 1790260440000,
+              "holdingBars": 5,
+              "grossLogReturn": -0.0011747284448996843,
+              "netLogReturn": -0.007174728444899685,
+              "cost": 0.006
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 1.6589861751152075,
+            "medianHoldingMinutes": 5,
+            "turnover": 2,
+            "grossPnl": -0.001174038721545756,
+            "netPnl": -0.007149051525776051,
+            "averageTrade": -0.007174728444899685,
+            "medianTrade": -0.007174728444899685,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.007149051525776051,
+            "exposure": 0.0057670126874279125,
+            "costPaid": 0.006,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.0035873642224498424
+          },
+          "decisionDigest": "754aaa82490c8ac237ec61906dc34479043c5bc32de7cb631742fae13508f084"
+        }
+      ],
+      "btc_momentum_v1": [
+        {
+          "strategyId": "btc_momentum_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "fees_only",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "92f3d38b49273c697bd3566dd0d26cbea628083532c6699e95a5438eaea9a968"
+        },
+        {
+          "strategyId": "btc_momentum_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "spread_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "92f3d38b49273c697bd3566dd0d26cbea628083532c6699e95a5438eaea9a968"
+        },
+        {
+          "strategyId": "btc_momentum_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "slippage_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "92f3d38b49273c697bd3566dd0d26cbea628083532c6699e95a5438eaea9a968"
+        },
+        {
+          "strategyId": "btc_momentum_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "combined",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 848,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "92f3d38b49273c697bd3566dd0d26cbea628083532c6699e95a5438eaea9a968"
+        }
+      ]
+    },
+    "validation": {
+      "flat": [
+        {
+          "strategyId": "flat",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "fees_only",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "0782082907fdb2553965743b9fe92163445137e79489bcda9c23d3ec7e2ad400"
+        },
+        {
+          "strategyId": "flat",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "spread_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "0782082907fdb2553965743b9fe92163445137e79489bcda9c23d3ec7e2ad400"
+        },
+        {
+          "strategyId": "flat",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "slippage_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "0782082907fdb2553965743b9fe92163445137e79489bcda9c23d3ec7e2ad400"
+        },
+        {
+          "strategyId": "flat",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "combined",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 0,
+            "completedRoundTrips": 0,
+            "tradesPerDay": 0,
+            "medianHoldingMinutes": null,
+            "turnover": 0,
+            "grossPnl": 0,
+            "netPnl": 0,
+            "averageTrade": null,
+            "medianTrade": null,
+            "hitRate": null,
+            "profitFactor": null,
+            "maxDrawdown": 0,
+            "exposure": 0,
+            "costPaid": 0,
+            "signalFlips": 0,
+            "returnPerUnitTurnover": null
+          },
+          "decisionDigest": "0782082907fdb2553965743b9fe92163445137e79489bcda9c23d3ec7e2ad400"
+        }
+      ],
+      "btc_momentum_baseline_v1": [
+        {
+          "strategyId": "btc_momentum_baseline_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "fees_only",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [
+            {
+              "entryBarIndex": 94,
+              "entryTimestamp": 1790266620000,
+              "exitBarIndex": 99,
+              "exitTimestamp": 1790266920000,
+              "holdingBars": 5,
+              "grossLogReturn": -0.0016920707035240356,
+              "netLogReturn": -0.006692070703524037,
+              "cost": 0.005
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 3.860589812332439,
+            "medianHoldingMinutes": 5,
+            "turnover": 2,
+            "grossPnl": -0.001690639958978557,
+            "netPnl": -0.006669728664323138,
+            "averageTrade": -0.006692070703524037,
+            "medianTrade": -0.006692070703524037,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.006669728664323138,
+            "exposure": 0.013440860215053764,
+            "costPaid": 0.005,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.0033460353517620186
+          },
+          "decisionDigest": "1ebfa3ce733c91b5e8ce2f0eebefc75efd7dc865ebf90e7eb95016aacbaad5e7"
+        },
+        {
+          "strategyId": "btc_momentum_baseline_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "spread_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [
+            {
+              "entryBarIndex": 94,
+              "entryTimestamp": 1790266620000,
+              "exitBarIndex": 99,
+              "exitTimestamp": 1790266920000,
+              "holdingBars": 5,
+              "grossLogReturn": -0.0016920707035240356,
+              "netLogReturn": -0.0020920707035240356,
+              "cost": 0.0004
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 3.860589812332439,
+            "medianHoldingMinutes": 5,
+            "turnover": 2,
+            "grossPnl": -0.001690639958978557,
+            "netPnl": -0.0020898838488937477,
+            "averageTrade": -0.0020920707035240356,
+            "medianTrade": -0.0020920707035240356,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.0031147291070916516,
+            "exposure": 0.013440860215053764,
+            "costPaid": 0.0004,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.0010460353517620178
+          },
+          "decisionDigest": "1ebfa3ce733c91b5e8ce2f0eebefc75efd7dc865ebf90e7eb95016aacbaad5e7"
+        },
+        {
+          "strategyId": "btc_momentum_baseline_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "slippage_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [
+            {
+              "entryBarIndex": 94,
+              "entryTimestamp": 1790266620000,
+              "exitBarIndex": 99,
+              "exitTimestamp": 1790266920000,
+              "holdingBars": 5,
+              "grossLogReturn": -0.0016920707035240356,
+              "netLogReturn": -0.0022920707035240357,
+              "cost": 0.0006
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 3.860589812332439,
+            "medianHoldingMinutes": 5,
+            "turnover": 2,
+            "grossPnl": -0.001690639958978557,
+            "netPnl": -0.002289445915252153,
+            "averageTrade": -0.0022920707035240357,
+            "medianTrade": -0.0022920707035240357,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.003214412649920728,
+            "exposure": 0.013440860215053764,
+            "costPaid": 0.0006,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.0011460353517620178
+          },
+          "decisionDigest": "1ebfa3ce733c91b5e8ce2f0eebefc75efd7dc865ebf90e7eb95016aacbaad5e7"
+        },
+        {
+          "strategyId": "btc_momentum_baseline_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "combined",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [
+            {
+              "entryBarIndex": 94,
+              "entryTimestamp": 1790266620000,
+              "exitBarIndex": 99,
+              "exitTimestamp": 1790266920000,
+              "holdingBars": 5,
+              "grossLogReturn": -0.0016920707035240356,
+              "netLogReturn": -0.007692070703524036,
+              "cost": 0.006
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 3.860589812332439,
+            "medianHoldingMinutes": 5,
+            "turnover": 2,
+            "grossPnl": -0.001690639958978557,
+            "netPnl": -0.007662562436036913,
+            "averageTrade": -0.007692070703524036,
+            "medianTrade": -0.007692070703524036,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.007662562436036913,
+            "exposure": 0.013440860215053764,
+            "costPaid": 0.006,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.003846035351762018
+          },
+          "decisionDigest": "1ebfa3ce733c91b5e8ce2f0eebefc75efd7dc865ebf90e7eb95016aacbaad5e7"
+        }
+      ],
+      "btc_momentum_v1": [
+        {
+          "strategyId": "btc_momentum_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "fees_only",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [
+            {
+              "entryBarIndex": 94,
+              "entryTimestamp": 1790266620000,
+              "exitBarIndex": 96,
+              "exitTimestamp": 1790266740000,
+              "holdingBars": 2,
+              "grossLogReturn": -0.0029195899719392784,
+              "netLogReturn": -0.007919589971939279,
+              "cost": 0.005
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 3.860589812332439,
+            "medianHoldingMinutes": 2,
+            "turnover": 2,
+            "grossPnl": -0.0029153321138783994,
+            "netPnl": -0.007888312641617823,
+            "averageTrade": -0.007919589971939279,
+            "medianTrade": -0.007919589971939279,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.007888312641617823,
+            "exposure": 0.005376344086021506,
+            "costPaid": 0.005,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.003959794985969639
+          },
+          "decisionDigest": "a6605c73f212d7eb74992b925c9c1b9e94e9c4f39c753f6ba857382142e54c5e"
+        },
+        {
+          "strategyId": "btc_momentum_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "spread_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 0
+          },
+          "trades": [
+            {
+              "entryBarIndex": 94,
+              "entryTimestamp": 1790266620000,
+              "exitBarIndex": 96,
+              "exitTimestamp": 1790266740000,
+              "holdingBars": 2,
+              "grossLogReturn": -0.0029195899719392784,
+              "netLogReturn": -0.0033195899719392786,
+              "cost": 0.0004
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 3.860589812332439,
+            "medianHoldingMinutes": 2,
+            "turnover": 2,
+            "grossPnl": -0.0029153321138783994,
+            "netPnl": -0.0033140862248939307,
+            "averageTrade": -0.0033195899719392786,
+            "medianTrade": -0.0033195899719392786,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.0033140862248939307,
+            "exposure": 0.005376344086021506,
+            "costPaid": 0.0004,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.0016597949859696393
+          },
+          "decisionDigest": "a6605c73f212d7eb74992b925c9c1b9e94e9c4f39c753f6ba857382142e54c5e"
+        },
+        {
+          "strategyId": "btc_momentum_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "slippage_only",
+            "feeBpsPerSide": 0,
+            "spreadBpsPerSide": 0,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [
+            {
+              "entryBarIndex": 94,
+              "entryTimestamp": 1790266620000,
+              "exitBarIndex": 96,
+              "exitTimestamp": 1790266740000,
+              "holdingBars": 2,
+              "grossLogReturn": -0.0029195899719392784,
+              "netLogReturn": -0.0035195899719392782,
+              "cost": 0.0006
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 3.860589812332439,
+            "medianHoldingMinutes": 2,
+            "turnover": 2,
+            "grossPnl": -0.0029153321138783994,
+            "netPnl": -0.0035134034752595245,
+            "averageTrade": -0.0035195899719392782,
+            "medianTrade": -0.0035195899719392782,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.0035134034752595245,
+            "exposure": 0.005376344086021506,
+            "costPaid": 0.0006,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.0017597949859696391
+          },
+          "decisionDigest": "a6605c73f212d7eb74992b925c9c1b9e94e9c4f39c753f6ba857382142e54c5e"
+        },
+        {
+          "strategyId": "btc_momentum_v1",
+          "strategyVersion": "v1",
+          "costScenario": {
+            "id": "combined",
+            "feeBpsPerSide": 25,
+            "spreadBpsPerSide": 2,
+            "slippageBpsPerSide": 3
+          },
+          "trades": [
+            {
+              "entryBarIndex": 94,
+              "entryTimestamp": 1790266620000,
+              "exitBarIndex": 96,
+              "exitTimestamp": 1790266740000,
+              "holdingBars": 2,
+              "grossLogReturn": -0.0029195899719392784,
+              "netLogReturn": -0.008919589971939278,
+              "cost": 0.006
+            }
+          ],
+          "metrics": {
+            "totalDecisions": 353,
+            "entryCount": 1,
+            "completedRoundTrips": 1,
+            "tradesPerDay": 3.860589812332439,
+            "medianHoldingMinutes": 2,
+            "turnover": 2,
+            "grossPnl": -0.0029153321138783994,
+            "netPnl": -0.008879928438443208,
+            "averageTrade": -0.008919589971939278,
+            "medianTrade": -0.008919589971939278,
+            "hitRate": 0,
+            "profitFactor": 0,
+            "maxDrawdown": 0.008879928438443208,
+            "exposure": 0.005376344086021506,
+            "costPaid": 0.006,
+            "signalFlips": 2,
+            "returnPerUnitTurnover": -0.004459794985969639
+          },
+          "decisionDigest": "a6605c73f212d7eb74992b925c9c1b9e94e9c4f39c753f6ba857382142e54c5e"
+        }
+      ]
+    }
+  },
+  "configuration": {
+    "timeframe": "1Min",
+    "momentumLookbackBars": 5,
+    "fastEmaSpan": 8,
+    "slowEmaSpan": 21,
+    "realizedVolWindowBars": 20,
+    "minimumMomentumBps": 70,
+    "momentumNoiseMultiple": 1.5,
+    "minimumEmaSpreadBps": 3,
+    "roundTripCostHurdleBps": 60,
+    "minimumHoldBars": 2,
+    "maximumHoldBars": 30,
+    "trailingStopVolMultiple": 2,
+    "minimumTrailingStopBps": 12
+  },
+  "limitations": [
+    "Provider OHLCV minute bars, not executable quotes or order-book data.",
+    "NEXT_BAR_CLOSE/v1 is an explicit conservative placeholder, not observed BTC PAPER execution timing.",
+    "No parameter was selected from this result; constants are frozen engineering hypotheses.",
+    "Long/flat unit exposure only; no broker authority, order submission, or live-money support is present."
+  ]
+}

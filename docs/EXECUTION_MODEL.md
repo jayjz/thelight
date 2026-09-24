@@ -15,6 +15,15 @@ The execution model is the canonical source for:
 
 Metrics must not implement a second, independent interpretation of execution timing.
 
+## BTC short-horizon research boundary
+
+`btc_momentum_v1` uses the same `NEXT_BAR_CLOSE/v1` causal convention in a
+standalone, read-only ledger: it accrues prior exposure, then applies a decision
+from completed bar *t* at close *t+1*. Fees, spread and slippage debit exactly
+once per turnover unit. This is not BTC PAPER execution, creates no durable
+intents, and grants no broker authority. See
+[BTC Momentum V1](experiments/BTC_MOMENTUM_V1.md).
+
 ---
 
 # Current replay assumption

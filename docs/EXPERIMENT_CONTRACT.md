@@ -241,6 +241,16 @@ do not redefine regime ground truth because Jev performed poorly.
 
 Further changes require a new experimental cycle and new untouched data.
 
+## Short-horizon BTC research
+
+BTC short-horizon research is a separate long/flat, read-only experiment family.
+Each artifact records durable-verified or explicit GET-only data source, exact
+range/hash, continuity requirement, frozen strategy/configuration, cost
+scenarios, timing model, controls, chronological partitions, decision digest,
+and failed as well as successful results. The runner rejects timestamp gaps
+rather than interpolating, forward-filling or repairing them. A replacement
+requires a new strategy ID/version and prospective frozen artifact.
+
 Thresholds
 
 Current thresholds are explicitly:

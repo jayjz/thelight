@@ -4,7 +4,7 @@
 
 Build a causally correct, evidence-producing quantitative research system that can run bounded PAPER experiments, preserve enough state to reconstruct every decision and execution event, and compare deterministic or typed-model treatments without collapsing research, risk, and broker authority.
 
-This roadmap reflects repository state as of **2026-09-22**. Older phase descriptions that treated live observation and PAPER brokerage as future work are superseded by the status below.
+This roadmap reflects repository state as of **2026-09-24**. Older phase descriptions that treated live observation and PAPER brokerage as future work are superseded by the status below.
 
 ---
 
@@ -79,9 +79,11 @@ Recent hardening:
 - duplicate/replayed fills remain idempotent;
 - stale fencing cannot apply execution projection or gain POST authority.
 
-### Current P1 issue
+### Lifecycle follow-through
 
-Durable `worker_runs.state` can lag the in-memory worker lifecycle (for example remain `STARTING` after the runtime is operationally READY). Lifecycle persistence hardening is the active runtime-correctness task.
+The prior durable lifecycle persistence defect was fixed on `main`. Retain
+multi-session soak validation for READY, STOPPED, HALTED and takeover evidence;
+this is operational verification, not an open reason to change authority.
 
 ---
 
@@ -183,6 +185,14 @@ Metrics must include at least:
 - modeled spread/slippage sensitivity.
 
 Use chronological development/validation partitions and retain failed experiments.
+
+### BTC research slice
+
+`btc_momentum_v1` is a separate, read-only BTC/USD minute-bar experiment. Its
+first frozen, cost-aware result is retained as a failure; it grants no broker
+authority and is not evidence for PAPER activation. See
+[BTC Momentum V1](experiments/BTC_MOMENTUM_V1.md). Future BTC candidates require
+a new strategy identity, wider verified data and a prospective OOS contract.
 
 ---
 

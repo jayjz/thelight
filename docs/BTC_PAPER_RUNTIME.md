@@ -210,10 +210,13 @@ completeness of older history. No 24h/72h soak or BTC execution is implied.
    **zero decisions/intents/orders/positions created by BTC**. Archive observations
    and investigate HALTED/DEGRADED episodes before authorizing the next milestone.
 
-This implementation is not a completed 24h/72h soak. The next milestone is BTC
-PAPER execution **after soak**, not strategy optimization. Out of scope: BTC PAPER
-order submission, fractional execution, crypto broker reconciliation, strategy
-calibration, cost/slippage tuning, ETH, portfolio execution and live-money trading.
+This implementation is not a completed 24h/72h soak. BTC PAPER execution remains
+deferred until after soak and stronger reproducible research evidence. A separate
+read-only `btc_momentum_v1` experiment may evaluate verified durable bars, but
+cannot reach this worker's broker boundary or alter continuity rules; its first
+result is retained as a failure. See [BTC Momentum V1](experiments/BTC_MOMENTUM_V1.md).
+Out of scope: BTC PAPER order submission, fractional execution, crypto broker
+reconciliation, ETH, portfolio execution and live-money trading.
 
 The retained manual `npm run alpaca:crypto-smoke` only observes one completed bar;
 it does not run a durable worker. Do not run it concurrently where Alpaca's

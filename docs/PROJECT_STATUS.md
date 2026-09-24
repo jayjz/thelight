@@ -1,7 +1,7 @@
 # LIGHTLIGHT Project Status
 
-**Snapshot:** 2026-09-22  
-**Integration baseline:** `feat/btc-paper-runtime`  
+**Snapshot:** 2026-09-24
+**Integration baseline:** `main` at merged BTC sparse-bootstrap recovery
 **Default branch:** `main`
 
 ## Executive summary
@@ -87,7 +87,9 @@ Capability is explicit: market/evidence support does not imply dispatch authorit
 
 ### 1. Worker lifecycle persistence
 
-Observed durable `worker_runs.state` can remain `STARTING` after the runtime is operationally READY.
+The prior `STARTING`-after-READY persistence defect was fixed on `main`; lifecycle
+transitions are now persisted through reconciliation and READY. Multi-session
+soak evidence is still required to validate the fix operationally.
 
 Target durable lifecycle:
 
@@ -156,16 +158,18 @@ Zero-volume bars are valid. No migration or broker authority is added. Stop usin
 SIGINT/SIGTERM. See the
 [BTC soak procedure](BTC_PAPER_RUNTIME.md#24h--72h-soak-procedure).
 
-24h/72h observation soak is pending. The next BTC milestone is PAPER execution
-after soak; fractional execution, broker reconciliation and strategy/cost tuning
-remain outside this slice.
+24h/72h observation soak is pending. A separate read-only short-horizon BTC
+research slice now evaluates frozen candidates only from the verified durable
+suffix; its first `btc_momentum_v1` result failed under conservative costs and
+does not alter runtime authority. BTC PAPER execution remains deferred after
+soak and stronger reproducible evidence. See
+[BTC Momentum V1](experiments/BTC_MOMENTUM_V1.md).
 
 ## Repository state
 
-`main` is the canonical baseline, including merged BTC B0-B3 and worker lifecycle
-persistence. Historical recovery is stacked on observer commit `40efc45430fc7d92458b59c94dac22244a5dcd4b`
-on `feat/btc-historical-recovery`, targeting `feat/btc-24x7-observer` for review.
-Neither PR is merged by this task.
+`main` is the canonical baseline, including the merged BTC observer, historical
+recovery and sparse-bootstrap qualification PRs. Merged feature branches are
+historical references, not active work.
 
 Do not delete inherited builder/Grok substrate until runtime dependencies have been audited.
 
