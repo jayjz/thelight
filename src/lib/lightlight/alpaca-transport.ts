@@ -40,4 +40,3 @@ export async function websocketPayloadToText(payload: unknown): Promise<string> 
   if (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload)) return new TextDecoder().decode(payload);
   throw new TypeError("Unsupported WebSocket payload.");
 }
-

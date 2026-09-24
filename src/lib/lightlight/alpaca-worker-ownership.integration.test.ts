@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
 import type { Sql } from "../db.ts";
-import { SqlAlpacaWorkerStore } from "./alpaca-worker-store.server.ts";
+import { SqlAlpacaWorkerStore, type GapRecoveryAttempt } from "./alpaca-worker-store.server.ts";
 import { DurableMarketWorker } from "./durable-market-worker.server.ts";
 import { BTC_USD_RUNTIME_IDENTITY, assertReadOnlyDurable } from "./runtime-identity.ts";
 import { loadBtcObserverSnapshot } from "./btc-observe.ts";
@@ -81,6 +81,7 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
     await cleanup.query("delete from worker_leases where worker_key like $1", [`${scope}%`]);
     await cleanup.query("delete from runtime_checkpoint where worker_key like $1", [`${scope}%`]);
     await cleanup.query("delete from market_bar_observations where symbol like $1", [`${scope}%`]);
+    await cleanup.query("delete from market_gap_recovery_attempts where worker_key like $1", [`${scope}%`]);
     await cleanup.query("delete from closed_bars where symbol like $1", [`${scope}%`]);
     await cleanup.query("delete from execution_intents where intent_id like $1", [`${scope}%`]);
     await cleanup.query("delete from decisions where decision_id like $1", [`${scope}%`]);
@@ -120,6 +121,35 @@ describe("Alpaca PAPER durable ownership (real Postgres, independent connections
       } catch (error) { await cleanup.query("ROLLBACK"); throw error; }
       assert.deepEqual((await cleanup.query("select state, stopped_at from worker_runs where run_id = $1", [a.snapshot().runId])).rows, oldRun.rows);
     } finally { await a.stop(); await b.stop(); }
+  });
+
+  it("atomically fences BTC observations, recovery completion and checkpoint after takeover", async () => {
+    const key = `${scope}:historical`; const symbol = `${scope}:historical:BTC/USD`;
+    const runA = `${scope}:historical:a`; const runB = `${scope}:historical:b`;
+    await storeA.createRun(runA, key, "STARTING"); await storeB.createRun(runB, key, "STARTING");
+    const leaseA = (await storeA.acquireOwnership(key, runA, 30))!;
+    const start = 1_726_000_020_000;
+    const attempt: GapRecoveryAttempt = { recoveryAttemptId: `${scope}:recovery`, workerKey: key, symbol,
+      missingStartMs: start, missingEndMs: start + 60_000, state: "BACKFILLING", detectedAt: new Date().toISOString() };
+    assert.deepEqual(await storeA.writeMarketEvidenceOwned(leaseA, { attempt: { value: attempt, create: true } }), []);
+    await storeA.releaseOwnership(leaseA);
+    const leaseB = (await storeB.acquireOwnership(key, runB, 30))!;
+    const bar = { t: start, open: 100, high: 102, low: 99, close: 101, volume: 0 };
+    const observation = { symbol, bar, providerEventTimestampMs: start, observedAt: new Date().toISOString(), origin: "REST_BACKFILL" as const, recoveryAttemptId: attempt.recoveryAttemptId };
+    const completed = { ...attempt, state: "HEALTHY" as const, result: "VERIFIED", returnedBarCount: 1, verifiedBarCount: 1 };
+    const write = { observations: [observation], attempt: { value: completed, create: false }, checkpoint: { latestRawBarTimestamp: start, marketEvidence: { backfilledBarCount: 0 } } as never };
+    assert.equal(await storeA.writeMarketEvidenceOwned(leaseA, write), null);
+    assert.equal(await storeA.readCheckpoint(key), null); assert.deepEqual(await storeA.listClosedBars(symbol), []);
+    assert.equal((await cleanup.query("select state from market_gap_recovery_attempts where recovery_attempt_id = $1", [attempt.recoveryAttemptId])).rows[0].state, "BACKFILLING");
+    assert.deepEqual(await storeB.writeMarketEvidenceOwned(leaseB, write), ["ACCEPTED"]);
+    assert.deepEqual(await storeB.writeMarketEvidenceOwned(leaseB, { observations: [observation] }), ["IDENTICAL"]);
+    assert.deepEqual(await storeB.writeMarketEvidenceOwned(leaseB, { observations: [{ ...observation, bar: { ...bar, close: 100 }, recoveryAttemptId: `${scope}:conflict` }], checkpointOnConflict: { latestRawBarTimestamp: start, haltReason: "MARKET_BAR_CONFLICT", marketEvidence: { backfilledBarCount: 1 } } as never }), ["CONFLICT"]);
+    assert.deepEqual(await storeB.listClosedBars(symbol), [bar]);
+    assert.equal((await storeB.readCheckpoint(key))?.latestRawBarTimestamp, start);
+    assert.equal((await storeB.readCheckpoint(key))?.haltReason, "MARKET_BAR_CONFLICT");
+    assert.equal((await storeB.readCheckpoint(key))?.marketEvidence?.backfilledBarCount, 1, "the fenced checkpoint counts the accepted backfill atomically");
+    assert.equal((await cleanup.query("select state from market_gap_recovery_attempts where recovery_attempt_id = $1", [attempt.recoveryAttemptId])).rows[0].state, "HEALTHY");
+    await storeB.releaseOwnership(leaseB);
   });
 
   it("has the migrated lease primary key and fencing/run evidence columns", async () => {

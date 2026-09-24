@@ -210,7 +210,7 @@ describe("BTC operator lifecycle", () => {
 function observerRow(age = 120_000) {
   return { now_ms: String(t + age), owner_run_id: "owner", fencing_token: "9", lease_expires_at: new Date(t + age + 30_000), lease_live: true,
     run_id: "owner", state: "READY", halt_reason: null, updated_at: new Date(t + age), latest_bar: String(t),
-    checkpoint_json: JSON.stringify({ latestRawBarTimestamp: t, marketEvidence: { runId: "owner", continuity: "UNVERIFIED", recoveredClosedBarCount: 2, stream: { state: "SUBSCRIBED", subscriptionAcknowledged: true, generation: 2, reconnectAttempt: 0 } } }) };
+    checkpoint_json: JSON.stringify({ latestRawBarTimestamp: t, marketEvidence: { runId: "owner", continuity: "VERIFIED", recoveredClosedBarCount: 2, stream: { state: "SUBSCRIBED", subscriptionAcknowledged: true, generation: 2, reconnectAttempt: 0 } } }) };
 }
 async function observe(row = observerRow()) {
   const query: ObserverQuery = { query: async <T extends Record<string, unknown>>(sql: string, values?: unknown[]) => {
@@ -252,7 +252,7 @@ describe("durable BTC observer", () => {
       assert.doesNotMatch(url.pathname, /\/(alpaca\.server|alpaca-worker\.server|execution\.server)\.ts$/);
       const raw = await readFile(url, "utf8");
       const code = ts.transpileModule(raw, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
-      assert.doesNotMatch(code, /paper-api\.alpaca|api\.alpaca\.markets|fetch\(/);
+      assert.doesNotMatch(code, /paper-api\.alpaca|api\.alpaca\.markets/);
       for (const match of code.matchAll(/(?:from\s*|import\s*\()?["'](\.[^"']+\.(?:ts|mjs))["']/g)) await inspect(new URL(match[1]!, url));
     }
     await inspect(new URL("../../../scripts/btc-market-worker.ts", import.meta.url));
@@ -261,5 +261,6 @@ describe("durable BTC observer", () => {
     assert.match(observer, /BEGIN READ ONLY/); assert.match(observer, /default_transaction_read_only=on/);
     assert.doesNotMatch(observer, /ALPACA_API|WebSocket|acquireOwnership|renewOwnership/);
     assert.ok(seen.has(new URL("./alpaca-crypto.server.ts", import.meta.url).href));
+    assert.ok(seen.has(new URL("./alpaca-crypto-historical.server.ts", import.meta.url).href));
   });
 });

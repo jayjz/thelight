@@ -53,6 +53,7 @@ export async function loadBtcObserverSnapshot(query: ObserverQuery) {
   if (!checkpointFresh || !evidenceMatchesRun) reasons.push("CHECKPOINT_STALE_OR_WRONG_RUN");
   if (!checkpointCaughtUp) reasons.push("CHECKPOINT_BEHIND_BARS");
   if (evidence?.continuity === "GAP_DETECTED") reasons.push("CONTINUITY_GAP_DETECTED");
+  if (evidence?.continuity !== "VERIFIED") reasons.push("HISTORICAL_CONTINUITY_UNVERIFIED");
   // DEGRADED is an observer projection; durable worker lifecycle is unchanged.
   const health = row.state === "HALTED" || row.state === "STOPPED" ? row.state :
     row.state === "STARTING" && row.lease_live ? "STARTING" :
@@ -69,7 +70,12 @@ export async function loadBtcObserverSnapshot(query: ObserverQuery) {
     lastBarPersistedAt: evidenceMatchesRun ? evidence?.lastBarPersistedAt ?? null : null,
     recoveredBarCount: evidenceMatchesRun ? evidence?.recoveredClosedBarCount ?? null : null,
     recoveryWindowMs: evidence?.recoveryWindowMs ?? null,
-    continuity: evidence?.continuity ?? "UNVERIFIED", backfill: "UNSUPPORTED",
+    continuity: evidence?.continuity ?? "UNVERIFIED", backfill: "REST_BACKFILL",
+    historicalContinuityVerified: evidenceMatchesRun && evidence?.continuity === "VERIFIED",
+    verifiedStartMs: evidence?.verifiedStartMs ?? null, verifiedThroughMs: evidence?.verifiedThroughMs ?? null,
+    recoveryState: checkpoint?.recoveryState ?? null,
+    recovery: evidence?.recovery ?? null,
+    backfilledBarCount: evidence?.backfilledBarCount ?? 0,
     haltReason: row.halt_reason ?? (evidenceMatchesRun ? checkpoint?.haltReason : null) ?? null,
     reconnectGeneration: stream?.generation ?? null, reconnectAttempt: stream?.reconnectAttempt ?? null,
     streamError: stream?.lastError ?? null, barFresh, checkpointFresh,

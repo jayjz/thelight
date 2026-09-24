@@ -96,7 +96,11 @@ BTC/USD minute bars, worker runs, a fenced lease and an owned checkpoint. Reconn
 is bounded inside the source; restart uses a new run and preserves prior evidence.
 The observer reports lease, subscription, bar/checkpoint freshness, reconnect and
 halt evidence. A three-minute bar-age threshold is operational only, active 24/7.
-Historical crypto backfill is unsupported; gaps remain visible uncertainty.
+Exact historical BTC recovery repairs missing closed minutes using fully paginated
+Alpaca US crypto bars, with REST_BACKFILL provenance and fenced writes. Startup
+verification is bounded to 24 hours; failures halt with visible GAP_DETECTED
+continuity. `npm run btc:historical-smoke` manually verifies three completed
+minutes without database or broker mutation.
 See [BTC operation and soak procedure](docs/BTC_PAPER_RUNTIME.md#247-read-only-operation).
 Next BTC milestone: PAPER execution after an observation soak, not strategy optimization.
 

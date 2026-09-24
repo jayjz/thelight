@@ -144,8 +144,14 @@ and database-only observer: `npm run btc:observe`. It records durable run, lease
 checkpoint and completed minute-bar evidence, with bounded source reconnect and
 restart recovery. Authority remains `READ_ONLY_DURABLE / MARKET_EVIDENCE_ONLY`,
 with zero broker authority or order submission. The operational bar-age limit is
-three minutes, active 24/7. Historical crypto backfill is unsupported; gaps remain
-visible uncertainty. Stop using SIGINT/SIGTERM. See the
+three minutes, active 24/7. Verified historical crypto recovery uses the Alpaca US
+bars endpoint, exact
+inclusive minute requests, complete pagination and REST_BACKFILL provenance.
+Startup is bounded to 24 hours and skips already verified durable intervals;
+live gaps are repaired before the next bar is accepted. Recovery/checkpoint
+writes are fenced. Incomplete or conflicting recovery remains GAP_DETECTED and
+halts; only exact durable verification produces VERIFIED. Zero-volume bars are
+valid. No migration or broker authority is added. Stop using SIGINT/SIGTERM. See the
 [BTC soak procedure](BTC_PAPER_RUNTIME.md#24h--72h-soak-procedure).
 
 24h/72h observation soak is pending. The next BTC milestone is PAPER execution
@@ -155,8 +161,9 @@ remain outside this slice.
 ## Repository state
 
 `main` is the canonical baseline, including merged BTC B0-B3 and worker lifecycle
-persistence. This slice is developed directly from `cd3236f` on
-`feat/btc-24x7-observer` and is submitted to `main` for review.
+persistence. Historical recovery is stacked on observer commit `40efc45430fc7d92458b59c94dac22244a5dcd4b`
+on `feat/btc-historical-recovery`, targeting `feat/btc-24x7-observer` for review.
+Neither PR is merged by this task.
 
 Do not delete inherited builder/Grok substrate until runtime dependencies have been audited.
 
